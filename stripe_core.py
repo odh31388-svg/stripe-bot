@@ -4,12 +4,13 @@ import urllib.parse
 from urllib.parse import unquote, urlencode, urljoin, urlparse
 from datetime import datetime
 import zipfile, tempfile, shutil
+import subprocess
 
 try:
-    import aiohttp
+    from curl_cffi.requests import AsyncSession
     import nodriver as uc
 except ImportError:
-    print("pip install aiohttp nodriver --break-system-packages"); sys.exit(1)
+    print("pip install curl-cffi nodriver websockets==13.1 --break-system-packages"); sys.exit(1)
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 SJUA = "stripe.js/da394b0aef; stripe-js-v3/da394b0aef; checkout"
@@ -127,6 +128,25 @@ def _create_proxy_auth_folder(host, port, user, pw):
 
     return ext_dir
 
+async def _start_browser_with_retry(proxy_entry, browser_args):
+    """محاولة فتح المتصفح 3 مرات لو فشل"""
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            log(f"[nodriver] starting browser (attempt {attempt}/3)...", C.YEL)
+            browser = await uc.start(
+                browser_executable_path='/usr/bin/chromium-browser',
+                browser_args=browser_args,
+                sandbox=False,
+            )
+            log("[nodriver] browser connected successfully!", C.LIME)
+            return browser
+        except Exception as e:
+            last_err = e
+            log(f"[nodriver] attempt {attempt} failed: {str(e)[:80]}", C.RED)
+            await asyncio.sleep(3) # استنى 3 ثواني وحاول تاني
+    raise last_err
+
 async def _run_nodriver_hcaptcha(checkout_url, proxy_entry=None, rqdata=None, sitekey=None):
     if not sitekey:
         log("[nodriver] missing sitekey — cannot solve", C.RED)
@@ -137,10 +157,10 @@ async def _run_nodriver_hcaptcha(checkout_url, proxy_entry=None, rqdata=None, si
         "--no-sandbox",
         "--disable-gpu",
         "--disable-dev-shm-usage",
-        "--single-process",
         "--disable-blink-features=AutomationControlled",
         "--window-size=1920,1080",
         "--lang=en-US",
+        "--remote-debugging-port=9222",
     ]
 
     ext_dir = None
@@ -158,11 +178,7 @@ async def _run_nodriver_hcaptcha(checkout_url, proxy_entry=None, rqdata=None, si
 
     browser = None
     try:
-        browser = await uc.start(
-            browser_executable_path='/usr/bin/chromium',
-            browser_args=browser_args,
-            sandbox=False,
-        )
+        browser = await _start_browser_with_retry(proxy_entry, browser_args)
         page = await browser.get(checkout_url)
         await page.sleep(3)
 
@@ -259,13 +275,14 @@ class StripeSession:
         self._current_card = None
         self._current_pm_id = None
 
-    def _pk(self):
+    def _proxy_kwargs(self):
         if not self._proxy: return {}
-        kw = {"proxy": self._proxy["url"]}
+        kw = {}
+        url = self._proxy["url"]
         auth = self._proxy.get("auth")
         if auth and isinstance(auth, (tuple, list)) and len(auth) == 2:
-            try: kw["proxy_auth"] = aiohttp.BasicAuth(str(auth[0]), str(auth[1]))
-            except: pass
+            url = url.replace("http://", f"http://{auth[0]}:{auth[1]}@")
+        kw["proxy"] = url
         return kw
 
     def _hdrs(self, ref=None):
@@ -294,13 +311,11 @@ class StripeSession:
         if not self.pk or not self.cs: return False, "missing cs/pk"
         
         if self.session: await self.session.close()
-        self.session = aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(ssl=False, limit=5),
-            timeout=aiohttp.ClientTimeout(total=15))
+        self.session = AsyncSession(impersonate="chrome", **self._proxy_kwargs())
         
         try:
             async with self.session.get(f"https://checkout.stripe.com/c/pay/{self.cs}",
-                headers={**self._hdrs(), "accept": "text/html,*/*"}, **self._pk()) as r: await r.text()
+                headers={**self._hdrs(), "accept": "text/html,*/*"}) as r: await r.text()
         except: pass
         
         async def do_telemetry():
@@ -311,7 +326,7 @@ class StripeSession:
                     "h": UA, "i": -300, "j": False, "k": 8, "l": 8}}
                 async with self.session.post("https://m.stripe.com/6", json=tel,
                     headers={"content-type":"application/json","origin":"https://js.stripe.com",
-                             "referer":"https://js.stripe.com/","user-agent":UA}, **self._pk()) as r:
+                             "referer":"https://js.stripe.com/","user-agent":UA}) as r:
                     if r.status == 200:
                         j = await r.json()
                         for k in ("muid","sid","guid"):
@@ -322,7 +337,7 @@ class StripeSession:
             try:
                 body = f"key={self.pk}&eid=NA&browser_locale=en-US&redirect_type=url"
                 async with self.session.post(f"https://api.stripe.com/v1/payment_pages/{self.cs}/init",
-                    headers=self._hdrs(), data=body, **self._pk()) as r: return await r.json()
+                    headers=self._hdrs(), data=body) as r: return await r.json()
             except Exception as e:
                 return {"_err": str(e)[:80]}
         
@@ -392,7 +407,7 @@ class StripeSession:
             data["client_attribution_metadata[payment_method_selection_flow]"] = "automatic"
         try:
             async with self.session.post("https://api.stripe.com/v1/payment_methods",
-                data=data, headers=self._hdrs(), **self._pk()) as r: j = await r.json()
+                data=data, headers=self._hdrs()) as r: j = await r.json()
             if "error" in j:
                 e = j["error"]
                 return None, (e.get("decline_code") or e.get("code") or "token_failed"), e.get("message", "")
@@ -436,7 +451,7 @@ class StripeSession:
         for label, data in variants:
             try:
                 async with self.session.post(f"https://api.stripe.com/v1/payment_pages/{self.cs}/confirm",
-                    data=data, headers=self._hdrs(), **self._pk(), timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    data=data, headers=self._hdrs(), timeout=15) as r:
                     j = await r.json()
                 if "error" not in j: return j, label
                 msg = j["error"].get("message", "")
@@ -465,7 +480,7 @@ class StripeSession:
                "user-agent":UA,"stripe-version":STRIPE_VER}
         try:
             async with self.session.post("https://api.stripe.com/v1/3ds2/authenticate",
-                data=data, headers=hdr, **self._pk(), timeout=aiohttp.ClientTimeout(total=15)) as r:
+                data=data, headers=hdr, timeout=15) as r:
                 return await r.json()
         except Exception as e: return {"error": {"message": str(e)[:80]}}
 
@@ -481,7 +496,7 @@ class StripeSession:
                "user-agent":UA,"stripe-version":STRIPE_VER}
         try:
             async with self.session.post(f"https://api.stripe.com/v1/{endpoint}/{pi_id}/confirm",
-                data=data, headers=hdr, **self._pk(), timeout=aiohttp.ClientTimeout(total=15)) as r:
+                data=data, headers=hdr, timeout=15) as r:
                 return await r.json()
         except Exception as e: return {"error": {"message": str(e)[:80]}}
 
@@ -491,7 +506,7 @@ class StripeSession:
         if token: data["captcha_response"] = token
         try:
             async with self.session.post(f"https://api.stripe.com/v1/{endpoint}/{pi_id}/verify_challenge",
-                data=data, headers=self._hdrs(), **self._pk(), timeout=aiohttp.ClientTimeout(total=15)) as r:
+                data=data, headers=self._hdrs(), timeout=15) as r:
                 return await r.json()
         except Exception as e: return {"error": {"message": str(e)[:80]}}
 
@@ -559,7 +574,7 @@ class StripeSession:
             mb = b64e(json.dumps(pl, separators=(",",":")).encode())
             try:
                 async with self.session.post(method_url, data=urlencode({"threeDSMethodData": mb}),
-                    headers={"content-type":"application/x-www-form-urlencoded","user-agent":UA}, **self._pk()) as r: await r.text()
+                    headers={"content-type":"application/x-www-form-urlencoded","user-agent":UA}) as r: await r.text()
             except: pass
             await asyncio.sleep(0.8)
         src = source or find_source_recursive(sdk) or find_source_recursive(conf)
