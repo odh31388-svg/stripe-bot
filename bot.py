@@ -1,18 +1,14 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-import os
-import sys
-import json
-import re
-import time
-import random
-import threading
-import queue
-import asyncio
-import requests
+import os, sys, json, re, time, random, threading, queue, asyncio
 from datetime import datetime
 from collections import defaultdict
+import requests
 from stripe_core import StripeSession, parse_card, log, C
+
+try:
+    from flask import Flask, jsonify
+except ImportError:
+    print("pip install flask --break-system-packages"); sys.exit(1)
 
 TG_TOKEN = ""
 TG_ADMIN = 0
@@ -26,8 +22,7 @@ def _tg_api(method, params):
     try:
         r = _tg_sess.post(f"https://api.telegram.org/bot{TG_TOKEN}/{method}", json=params, timeout=15)
         return r.json()
-    except:
-        return None
+    except: return None
 
 def _send(cid, text, rt=None):
     p = {"chat_id": cid, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
@@ -57,7 +52,6 @@ async def check_one_card(cid, mid, url, card, idx, total, summary, summary_lock)
         
         icon = {"CHARGED": "✅", "LIVE": "💚", "REQUIRES_ACTION": "🔐", "DECLINED": "❌", "ERROR": "⚠️", "SESSION_EXPIRED": "⚠️"}.get(st, "❌")
         
-        # تنسيق رسالة التليجرام المزخرفة والحارقة
         body = (
             f"<b>🔥 STRIPE HITTER - V13.5 🔥</b>\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
