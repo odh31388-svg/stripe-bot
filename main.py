@@ -3,7 +3,7 @@ import sys
 from stripe_core import StripeSession, parse_card, log, C
 
 async def main():
-    print(f"{C.CYN}{C.B}═══ Stripe Direct Checker ═══{C.R}\n")
+    print(f"{C.CYN}{C.B}═══ Stripe Direct Checker (Proxy-Free) ═══{C.R}\n")
     url = input(f"{C.GOLD}▸ أدخل رابط Stripe Checkout: {C.R}").strip()
     if not url.startswith("http"):
         print(f"{C.RED}❌ رابط غير صالح.{C.R}")
@@ -28,7 +28,7 @@ async def main():
         print(f"{C.CYN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.R}")
         print(f"{C.YEL}⏳ بطاقة [{i}/{len(cards)}]: {card['cc']}|{card['mm']}|{card['yy']}|{card['cvv']}{C.R}")
         
-        sess = StripeSession(url)
+        sess = StripeSession(url) # بدون بروكسي
         ok, err = await sess.prefetch()
         if not ok:
             print(f"{C.RED}❌ فشل الاتصال بالجلسة: {err}{C.R}\n")
