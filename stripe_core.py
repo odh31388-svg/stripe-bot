@@ -235,6 +235,12 @@ async def _run_nodriver_hcaptcha(checkout_url, proxy_entry=None, rqdata=None, si
         try:
             if browser: browser.stop()
         except Exception: pass
+        
+        try: os.system("pkill -9 -f chromium > /dev/null 2>&1")
+        except Exception: pass
+        try: os.system("pkill -9 -f chrome > /dev/null 2>&1")
+        except Exception: pass
+        
         if ext_dir and os.path.exists(ext_dir):
             try: shutil.rmtree(ext_dir, ignore_errors=True)
             except Exception: pass
