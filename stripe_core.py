@@ -133,8 +133,11 @@ async def _run_nodriver_hcaptcha(checkout_url, proxy_entry=None, rqdata=None, si
         return None
 
     browser_args = [
+        "--headless=new",
         "--no-sandbox",
+        "--disable-gpu",
         "--disable-dev-shm-usage",
+        "--single-process",
         "--disable-blink-features=AutomationControlled",
         "--window-size=1920,1080",
         "--lang=en-US",
@@ -155,7 +158,11 @@ async def _run_nodriver_hcaptcha(checkout_url, proxy_entry=None, rqdata=None, si
 
     browser = None
     try:
-        browser = await uc.start(headless=True, browser_args=browser_args, sandbox=False)
+        browser = await uc.start(
+            browser_executable_path='/usr/bin/chromium',
+            browser_args=browser_args,
+            sandbox=False,
+        )
         page = await browser.get(checkout_url)
         await page.sleep(3)
 
