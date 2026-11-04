@@ -38,7 +38,7 @@ us-free-proxy.g-w.info:59781:user3proxyserver:huccuAn_oc7o87hubhjYY
 """.strip().splitlines()
 
 MAX_CARD_RETRIES = 3
-MAX_PARALLEL_CARDS = 2
+MAX_PARALLEL_CARDS = 1
 
 def parse_proxy_full(l):
     l = l.strip()
