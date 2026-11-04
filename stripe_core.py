@@ -1,13 +1,26 @@
-# language: Python 3.10+, file: stripe_core.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 import os
 import re
+import sys
 import json
 import time
+import uuid
+import hmac
 import base64
-import urllib.parse
 import random
+import hashlib
 import asyncio
-from typing import Dict, Optional
+import secrets
+import urllib.parse
+from urllib.parse import unquote, urlencode, urljoin, urlparse
+from datetime import datetime
+from typing import Any, Dict, Optional
+
+try:
+    from curl_cffi.requests import AsyncSession
+except ImportError:
+    AsyncSession = None
 
 class C:
     R = "\033[0m"
@@ -53,7 +66,7 @@ class StripeSession:
 
     def _decode_fid(self, fragment: str) -> Optional[dict]:
         try:
-            raw = urllib.parse.unquote(fragment.strip()).rstrip('%')
+            raw = unquote(fragment.strip()).rstrip('%')
             pad = raw + "=" * (-len(raw) % 4)
             if '-' in pad or '_' in pad:
                 pad = pad.translate(str.maketrans('-_', '+/'))
@@ -92,8 +105,9 @@ class StripeSession:
             if not self.pk or not self.cs:
                 return False, "لم يتم العثور على مفاتيح PK أو CS في الرابط."
 
-            import curl_cffi.requests as cffi
-            self.session = cffi.AsyncSession(impersonate="chrome110", verify=False)
+            if AsyncSession:
+                self.session = AsyncSession(impersonate="chrome110", verify=False)
+            
             ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36'
 
             init_headers = {
