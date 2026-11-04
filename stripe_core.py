@@ -4,13 +4,12 @@ import urllib.parse
 from urllib.parse import unquote, urlencode, urljoin, urlparse
 from datetime import datetime
 import zipfile, tempfile, shutil
-import subprocess
 
 try:
     from curl_cffi.requests import AsyncSession
     import nodriver as uc
 except ImportError:
-    print("pip install curl-cffi nodriver websockets==13.1 --break-system-packages"); sys.exit(1)
+    print("pip install curl-cffi nodriver websockets>=14 --break-system-packages"); sys.exit(1)
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 SJUA = "stripe.js/da394b0aef; stripe-js-v3/da394b0aef; checkout"
@@ -129,7 +128,6 @@ def _create_proxy_auth_folder(host, port, user, pw):
     return ext_dir
 
 async def _start_browser_with_retry(proxy_entry, browser_args):
-    """محاولة فتح المتصفح 3 مرات لو فشل"""
     last_err = None
     for attempt in range(1, 4):
         try:
@@ -144,7 +142,7 @@ async def _start_browser_with_retry(proxy_entry, browser_args):
         except Exception as e:
             last_err = e
             log(f"[nodriver] attempt {attempt} failed: {str(e)[:80]}", C.RED)
-            await asyncio.sleep(3) # استنى 3 ثواني وحاول تاني
+            await asyncio.sleep(3)
     raise last_err
 
 async def _run_nodriver_hcaptcha(checkout_url, proxy_entry=None, rqdata=None, sitekey=None):
@@ -314,8 +312,8 @@ class StripeSession:
         self.session = AsyncSession(impersonate="chrome", **self._proxy_kwargs())
         
         try:
-            async with self.session.get(f"https://checkout.stripe.com/c/pay/{self.cs}",
-                headers={**self._hdrs(), "accept": "text/html,*/*"}) as r: await r.text()
+            await self.session.get(f"https://checkout.stripe.com/c/pay/{self.cs}",
+                headers={**self._hdrs(), "accept": "text/html,*/*"})
         except: pass
         
         async def do_telemetry():
@@ -324,20 +322,21 @@ class StripeSession:
                     "a": self.pk, "b": f"https://checkout.stripe.com/c/pay/{self.cs}",
                     "c": 24, "d": "1920x1080", "e": False, "f": "en-US", "g": "Win32",
                     "h": UA, "i": -300, "j": False, "k": 8, "l": 8}}
-                async with self.session.post("https://m.stripe.com/6", json=tel,
+                r = await self.session.post("https://m.stripe.com/6", json=tel,
                     headers={"content-type":"application/json","origin":"https://js.stripe.com",
-                             "referer":"https://js.stripe.com/","user-agent":UA}) as r:
-                    if r.status == 200:
-                        j = await r.json()
-                        for k in ("muid","sid","guid"):
-                            if j.get(k): self.tracking[k] = j[k]
+                             "referer":"https://js.stripe.com/","user-agent":UA})
+                if r.status_code == 200:
+                    j = r.json()
+                    for k in ("muid","sid","guid"):
+                        if j.get(k): self.tracking[k] = j[k]
             except: pass
         
         async def do_init():
             try:
                 body = f"key={self.pk}&eid=NA&browser_locale=en-US&redirect_type=url"
-                async with self.session.post(f"https://api.stripe.com/v1/payment_pages/{self.cs}/init",
-                    headers=self._hdrs(), data=body) as r: return await r.json()
+                r = await self.session.post(f"https://api.stripe.com/v1/payment_pages/{self.cs}/init",
+                    headers=self._hdrs(), data=body)
+                return r.json()
             except Exception as e:
                 return {"_err": str(e)[:80]}
         
@@ -406,8 +405,9 @@ class StripeSession:
             data["client_attribution_metadata[merchant_integration_version]"] = "hosted_checkout"
             data["client_attribution_metadata[payment_method_selection_flow]"] = "automatic"
         try:
-            async with self.session.post("https://api.stripe.com/v1/payment_methods",
-                data=data, headers=self._hdrs()) as r: j = await r.json()
+            r = await self.session.post("https://api.stripe.com/v1/payment_methods",
+                data=data, headers=self._hdrs())
+            j = r.json()
             if "error" in j:
                 e = j["error"]
                 return None, (e.get("decline_code") or e.get("code") or "token_failed"), e.get("message", "")
@@ -450,9 +450,9 @@ class StripeSession:
         last_err = None
         for label, data in variants:
             try:
-                async with self.session.post(f"https://api.stripe.com/v1/payment_pages/{self.cs}/confirm",
-                    data=data, headers=self._hdrs(), timeout=15) as r:
-                    j = await r.json()
+                r = await self.session.post(f"https://api.stripe.com/v1/payment_pages/{self.cs}/confirm",
+                    data=data, headers=self._hdrs(), timeout=15)
+                j = r.json()
                 if "error" not in j: return j, label
                 msg = j["error"].get("message", "")
                 if is_param_error(msg): last_err = j; continue
@@ -479,9 +479,9 @@ class StripeSession:
                "origin":"https://js.stripe.com","referer":"https://js.stripe.com/",
                "user-agent":UA,"stripe-version":STRIPE_VER}
         try:
-            async with self.session.post("https://api.stripe.com/v1/3ds2/authenticate",
-                data=data, headers=hdr, timeout=15) as r:
-                return await r.json()
+            r = await self.session.post("https://api.stripe.com/v1/3ds2/authenticate",
+                data=data, headers=hdr, timeout=15)
+            return r.json()
         except Exception as e: return {"error": {"message": str(e)[:80]}}
 
     async def _confirm_direct(self, pi_id, client_secret, pm_id):
@@ -495,9 +495,9 @@ class StripeSession:
                "origin":"https://js.stripe.com","referer":"https://js.stripe.com/",
                "user-agent":UA,"stripe-version":STRIPE_VER}
         try:
-            async with self.session.post(f"https://api.stripe.com/v1/{endpoint}/{pi_id}/confirm",
-                data=data, headers=hdr, timeout=15) as r:
-                return await r.json()
+            r = await self.session.post(f"https://api.stripe.com/v1/{endpoint}/{pi_id}/confirm",
+                data=data, headers=hdr, timeout=15)
+            return r.json()
         except Exception as e: return {"error": {"message": str(e)[:80]}}
 
     async def _verify_challenge(self, pi_id, client_secret, token=""):
@@ -505,9 +505,9 @@ class StripeSession:
         data = {"key": self.pk, "client_secret": client_secret}
         if token: data["captcha_response"] = token
         try:
-            async with self.session.post(f"https://api.stripe.com/v1/{endpoint}/{pi_id}/verify_challenge",
-                data=data, headers=self._hdrs(), timeout=15) as r:
-                return await r.json()
+            r = await self.session.post(f"https://api.stripe.com/v1/{endpoint}/{pi_id}/verify_challenge",
+                data=data, headers=self._hdrs(), timeout=15)
+            return r.json()
         except Exception as e: return {"error": {"message": str(e)[:80]}}
 
     async def _handle_waf(self, conf, pi):
@@ -573,8 +573,8 @@ class StripeSession:
             pl = {"threeDSServerTransID": stid, "threeDSMethodNotificationURL": notify_url}
             mb = b64e(json.dumps(pl, separators=(",",":")).encode())
             try:
-                async with self.session.post(method_url, data=urlencode({"threeDSMethodData": mb}),
-                    headers={"content-type":"application/x-www-form-urlencoded","user-agent":UA}) as r: await r.text()
+                await self.session.post(method_url, data=urlencode({"threeDSMethodData": mb}),
+                    headers={"content-type":"application/x-www-form-urlencoded","user-agent":UA})
             except: pass
             await asyncio.sleep(0.8)
         src = source or find_source_recursive(sdk) or find_source_recursive(conf)
