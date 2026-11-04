@@ -69,7 +69,6 @@ async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
     if os.path.exists(hc_file_path):
         with open(hc_file_path, "r") as f:
             hc_script_text = f.read()
-        log("[cache] Loaded hCaptcha script from local cache!", C.LIME)
     else:
         log("[proxy] Fetching script via Google Translate...", C.GOLD)
         session = AsyncSession(impersonate="chrome", timeout=20)
@@ -87,8 +86,46 @@ async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
             await session.close()
 
     if not hc_script_text:
-        log("[error] Could not get hCaptcha script.", C.RED)
         return None
+
+    # الكود اللي إنت بعته (للضغط على الكابتشا لو ظهرت)
+    usagi_script = """
+    (function() {
+      'use strict';
+      window.__USAGI_HCAPTCHA_LOADED = true;
+      const isHcaptchaFrame = window.location.href.includes('hcaptcha.com') ||
+                             window.location.href.includes('hcaptcha') ||
+                             window.location.href.includes('newassets.hcaptcha.com');
+      if (!isHcaptchaFrame) { return; }
+      const checkboxSelector = '#checkbox';
+      const checkedAttribute = 'data-checked';
+      let clicked = false;
+      let checkInterval = null;
+      function tryClickCheckbox() {
+        const checkbox = document.querySelector(checkboxSelector);
+        if (!checkbox) { return false; }
+        const isChecked = checkbox.getAttribute(checkedAttribute);
+        if (isChecked === 'true') { if (checkInterval) clearInterval(checkInterval); return true; }
+        if (isChecked !== 'true' && !clicked) {
+          try {
+            checkbox.click();
+            clicked = true;
+            setTimeout(() => {
+              const newIsChecked = checkbox.getAttribute(checkedAttribute);
+              if (newIsChecked === 'true') { if (checkInterval) clearInterval(checkInterval); }
+            }, 500);
+            return true;
+          } catch (e) { return false; }
+        }
+        return false;
+      }
+      setTimeout(tryClickCheckbox, 100);
+      setTimeout(tryClickCheckbox, 500);
+      setTimeout(tryClickCheckbox, 1000);
+      checkInterval = setInterval(function() { if (!clicked) tryClickCheckbox(); }, 500);
+      setTimeout(() => { if (checkInterval) clearInterval(checkInterval); }, 30000);
+    })();
+    """
 
     node_script = """
     const { chromium } = require('playwright');
@@ -98,6 +135,7 @@ async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
     const rqdata = process.argv[4];
     const hc_file = process.argv[5];
     const hc_script = fs.readFileSync(hc_file, 'utf8');
+    const usagi_script = `""" + usagi_script + """`;
 
     (async () => {
         try {
@@ -107,9 +145,12 @@ async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
                 args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
             });
             const context = await browser.newContext({ bypassCSP: true });
+            
+            // حقن كود الضغط على الكابتشا
+            await context.addInitScript(usagi_script);
+            
             const page = await context.newPage();
             
-            // مراقبة الكونسول والأخطاء
             page.on('console', msg => console.log('BROWSER_LOG: ' + msg.text()));
             page.on('pageerror', err => console.log('BROWSER_ERROR: ' + err.message));
             
@@ -118,15 +159,15 @@ async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
                 if (reqUrl.includes('api.js')) {
                     await route.fulfill({ status: 200, contentType: 'application/javascript', body: hc_script });
                 } else {
-                    // اعتراض طلبات التحدي وهمياً عشان ميعملش Timeout
-                    await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' });
+                    await route.continue(); // نكمل الطلبات عشان الكابتشا تشتغل طبيعي
                 }
             });
             
+            // الرابط هيبقى كامل بالـ #fid إن شاء الله
             await page.goto(url, { waitUntil: 'domcontentloaded' });
-            await page.waitForTimeout(2000);
+            await page.waitForTimeout(3000);
             
-            // حقن مباشر بدون addScriptTag
+            // حقن مباشر 
             await page.evaluate(hc_script);
             await page.waitForTimeout(2000);
             
@@ -155,7 +196,7 @@ async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
     with open(node_file_path, "w") as f:
         f.write(node_script)
 
-    log("[playwright] Running Playwright with deep inspection...", C.GOLD)
+    log("[playwright] Running Playwright with FULL URL & USAGI...", C.GOLD)
     try:
         process = await asyncio.create_subprocess_exec(
             "node", node_file_path, checkout_url, sitekey, (rqdata or ""), hc_file_path,
@@ -165,9 +206,8 @@ async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
         stdout, stderr = await process.communicate()
         out = stdout.decode().strip()
         
-        # طباعة لوجات المتصفح عشان نشوف الأخطاء
         for line in out.split('\n'):
-            if line.startswith('BROWSER_'):
+            if line.startswith('BROWSER_ERROR') or line.startswith('BROWSER_LOG'):
                 log(line, C.CYN)
         
         if "FINAL_TOKEN: " in out:
@@ -396,8 +436,8 @@ class StripeSession:
         
         if self.cs:
             log("S4: Playwright (Node.js) Browser", C.GOLD)
-            checkout_url = f"https://checkout.stripe.com/c/pay/{self.cs}"
-            token = await _run_playwright_hcaptcha(checkout_url, rqdata, site_key)
+            # التعديل هنا: استخدام self.url بدل ما نبني الرابط من غير الـ #
+            token = await _run_playwright_hcaptcha(self.url, rqdata, site_key)
             if token:
                 log("  Got hCaptcha token! Verifying...", C.LIME)
                 r = await self._verify_challenge(pi_id, cs_secret, token)
