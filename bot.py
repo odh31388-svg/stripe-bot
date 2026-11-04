@@ -45,7 +45,7 @@ async def check_one_card(cid, mid, url, card, idx, total, summary, summary_lock)
         async with summary_lock:
             summary[st] = summary.get(st, 0) + 1
         
-        icon = {"CHARGED": "✅", "LIVE": "💚", "REQUIRES_ACTION": "🔐", "DECLINED": "❌", "ERROR": "⚠️", "SESSION_EXPIRED": "⚠️"}.get(st, "❌")
+        icon = {"CHARGED": "✅", "LIVE": "💚", "REQUIRES_ACTION": "🔐", "DECLINED": "❌", "ERROR": "⚠️", "SESSION_EXPIRED": "⚠️", "WAF_FAILED": "🤖"}.get(st, "❌")
         
         body = (
             f"<b>🔥 STRIPE HITTER - V13.5 🔥</b>\n"
@@ -64,7 +64,7 @@ async def check_one_card(cid, mid, url, card, idx, total, summary, summary_lock)
         _send(cid, f"⚠️ <b>بطاقة {idx}/{total}: فشلت</b>\n<code>{card['cc']}|{card['mm']}|{card['yy']}|{card['cvv']}</code>\n{str(e)[:50]}", rt=mid)
 
 def process_task(cid, mid, url, cards):
-    _send(cid, f"⏳ <b>جاري بدء فحص {len(cards)} بطاقة...</b>", rt=mid)
+    _send(cid, f"⏳ <b>جاري بدء فحص {len(cards)} بطاقة (كرت ورا كرت)...</b>", rt=mid)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     
@@ -72,21 +72,23 @@ def process_task(cid, mid, url, cards):
         summary = defaultdict(int)
         summary_lock = asyncio.Lock()
         
+        # الفحص بالترتيب (كرت ورا كرت)
         for i, card in enumerate(cards):
             await check_one_card(cid, mid, url, card, i+1, len(cards), summary, summary_lock)
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(1) # تأخير ثانية عشان ميحصلش حظر للـ IP
             
         s = summary
         summary_text = (
-            f"<b>📊 ملخص الفحص النهائي</b>\n"
+            f"<b>📊 ملخص الفحص</b>\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
             f"✅ CHARGED: <b>{s.get('CHARGED', 0)}</b>\n"
             f"💚 LIVE: <b>{s.get('LIVE', 0)}</b>\n"
             f"🔐 3DS / OTP: <b>{s.get('REQUIRES_ACTION', 0)}</b>\n"
             f"❌ DECLINED: <b>{s.get('DECLINED', 0)}</b>\n"
+            f"🤖 WAF FAILED: <b>{s.get('WAF_FAILED', 0)}</b>\n"
             f"⚠️ ERROR: <b>{s.get('ERROR', 0)}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
-            f"🎯 المجموع الفعال: {sum(s.values())}/{len(cards)}"
+            f"🎯 المجموع: {sum(s.values())}/{len(cards)}"
         )
         _send(cid, summary_text, rt=mid)
     
@@ -137,7 +139,7 @@ def _poll():
                 if txt in ("/start", "/reset"):
                     with user_lock: 
                         user_state[cid] = {'step': 'url', 'url': None}
-                    _send(cid, "🔥 <b>مرحباً بك في بوت Stripe Hitter الخارق</b>\n\n📎 <b>أرسل رابط Stripe (Checkout / Link):</b>", rt=mid)
+                    _send(cid, "🔥 <b>مرحباً بك في بوت Stripe السريع</b>\n\n📎 <b>أرسل رابط Stripe (Checkout / Link):</b>", rt=mid)
                     continue
                     
                 with user_lock: 
@@ -149,19 +151,19 @@ def _poll():
                         continue
                     with user_lock: 
                         user_state[cid] = {'step': 'cards', 'url': txt}
-                    _send(cid, f"✅ <b>تم حفظ الرابط بنجاح.</b>\n📨 أرسل البطاقات الآن بالصيغة (<code>CC|MM|YY|CVV</code>):", rt=mid)
+                    _send(cid, f"✅ <b>تم حفظ الرابط.</b>\n📨 أرسل البطاقات الآن (<code>CC|MM|YY|CVV</code>):", rt=mid)
                     continue
                     
                 if state['step'] == 'cards':
                     cards = parse_cards_block(txt)
                     if not cards:
-                        _send(cid, "❌ <b>خطأ في صيغة البطاقات!</b> استخدم صيغة: <code>CC|MM|YY|CVV</code>", rt=mid)
+                        _send(cid, "❌ <b>خطأ في الصيغة!</b> استخدم: <code>CC|MM|YY|CVV</code>", rt=mid)
                         continue
                     url = state['url']
                     _tq.put((cid, mid, url, cards))
                     with user_lock: 
                         user_state[cid] = {'step': 'url', 'url': None}
-                    _send(cid, f"📥 <b>تم استلام {len(cards)} بطاقة — بدأ الفحص الفوري...</b>", rt=mid)
+                    _send(cid, f"📥 <b>تم استلام {len(cards)} بطاقة — بدأ الفحص...</b>", rt=mid)
                     continue
         except Exception as e:
             log(f"poll: {e}", C.RED)
@@ -169,7 +171,7 @@ def _poll():
 
 if __name__ == "__main__":
     os.system("clear" if os.name != "nt" else "cls")
-    print(f"{C.CYN}{C.B}═══ STRIPE BOT v13.5 (ULTRA) ═══{C.R}\n")
+    print(f"{C.CYN}{C.B}═══ STRIPE BOT FAST ═══{C.R}\n")
     TG_TOKEN = input(f"{C.GOLD}▸ Bot Token:{C.R} ").strip()
     try: 
         TG_ADMIN = int(input(f"{C.GOLD}▸ Admin ID:{C.R} ").strip())
@@ -183,6 +185,6 @@ if __name__ == "__main__":
     
     threading.Thread(target=_worker, daemon=True).start()
     threading.Thread(target=_poll, daemon=True).start()
-    log("جاهز لاستقبال الأوامر! /start", C.LIME)
+    log("جاهز! /start", C.LIME)
     while True: 
         time.sleep(10)
