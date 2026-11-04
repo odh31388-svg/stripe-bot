@@ -92,50 +92,61 @@ async def _run_nodriver_hcaptcha(checkout_url, rqdata=None, sitekey=None):
     try:
         browser = await _start_browser_with_retry(browser_args)
         page = await browser.get(checkout_url)
-        await page.sleep(2)
+        await page.sleep(1)
         
+        # --- فكرة الاعتراض الجديدة ---
+        log("[nodriver] Enabling CDP Network Interception...", C.GOLD)
+        await page.send(cdp.fetch.enable(patterns=[cdp.fetch.RequestPattern(url_pattern="*hcaptcha*")]))
+        
+        async def on_request_paused(event: cdp.fetch.RequestPaused):
+            try:
+                req_url = event.request.url
+                if "js.hcaptcha.com" in req_url:
+                    log(f"[CDP] Intercepted: {req_url}", C.CYN)
+                    # جلب السكريبت بـ curl_cffi
+                    s = AsyncSession(impersonate="chrome", timeout=15)
+                    try:
+                        r = await s.get(req_url)
+                        if r.status_code == 200:
+                            body_b64 = base64.b64encode(r.content).decode('utf-8')
+                            # حقن الرد في المتصفح
+                            await page.send(cdp.fetch.fulfill_request(
+                                request_id=event.request_id,
+                                response_code=200,
+                                response_headers=[{"name": "Content-Type", "value": "application/javascript"}],
+                                body=body_b64
+                            ))
+                            log("[CDP] Script fulfilled successfully!", C.LIME)
+                        else:
+                            log(f"[CDP] curl_cffi status {r.status_code}", C.RED)
+                            await page.send(cdp.fetch.continue_request(request_id=event.request_id))
+                    except Exception as e:
+                        log(f"[CDP] Fetch error: {e}", C.RED)
+                        await page.send(cdp.fetch.continue_request(request_id=event.request_id))
+                    finally:
+                        await s.close()
+                else:
+                    # استكمال الطلبات التانية عادي
+                    await page.send(cdp.fetch.continue_request(request_id=event.request_id))
+            except Exception as e:
+                log(f"[CDP] Intercept handler error: {e}", C.RED)
+
+        page.add_handler(cdp.fetch.RequestPaused, on_request_paused)
+        # ------------------------------
+
+        # استنى شوية عشان السكريبت يتحمل ويعمل setup
+        await page.sleep(3)
+
         try:
             await page.send(cdp.page.set_bypass_csp(enabled=True))
         except: pass
 
-        log("[nodriver] Fetching hCaptcha script via curl-cffi to bypass network block...", C.GOLD)
-        # الخطة الجديدة: تنزيل السكريبت بـ curl_cffi وحقنه كـ Inline
-        hc_script_text = ""
-        session = AsyncSession(impersonate="chrome")
-        try:
-            r = await session.get("https://js.hcaptcha.com/1/api.js?render=explicit")
-            if r.status_code == 200:
-                hc_script_text = r.text
-                log(f"[curl_cffi] hCaptcha script downloaded ({len(hc_script_text)} bytes)", C.LIME)
-            else:
-                log(f"[curl_cffi] failed to download hCaptcha script. HTTP {r.status_code}", C.RED)
-        except Exception as e:
-            log(f"[curl_cffi] Error fetching script: {e}", C.RED)
-        finally:
-            await session.close()
-
-        if not hc_script_text:
-            log("[nodriver] Cannot proceed without hCaptcha script", C.RED)
-            return None
-
-        # حقن الكود مباشرة في الصفحة
-        js_inject = f"""
-        (function() {{
-            var script = document.createElement('script');
-            script.type = 'text/javascript';
-            script.text = {json.dumps(hc_script_text)};
-            document.head.appendChild(script);
-        }})();
-        """
-        await page.evaluate(js_inject)
-        await page.sleep(1) # استنى ثانية عشان السكريبت يشتغل
-
         hc_loaded = await page.evaluate("typeof hcaptcha !== 'undefined' && hcaptcha.render")
         if not hc_loaded:
-            log("[nodriver] Inline injection failed. hcaptcha still undefined.", C.RED)
+            log("[nodriver] hCaptcha still undefined after CDP intercept.", C.RED)
             return None
         
-        log("[nodriver] hCaptcha injected and loaded successfully!", C.LIME)
+        log("[nodriver] hCaptcha loaded via CDP!", C.LIME)
 
         rq_safe = (rqdata or "").replace("\\", "\\\\").replace("'", "\\'")
         sk_safe = sitekey.replace("'", "\\'")
