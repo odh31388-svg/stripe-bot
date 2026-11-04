@@ -58,7 +58,6 @@ def is_param_error(msg):
     return ("unknown parameter" in m or "parameter_unknown" in m
             or "received unknown" in m or "did you mean" in m)
 
-# --- الفكرة الجديدة: تخطي الـ DNS ---
 async def _get_hcaptcha_ip():
     log("[dns] Asking Cloudflare for hCaptcha IP to bypass VPN block...", C.GOLD)
     session = AsyncSession(impersonate="chrome", timeout=10)
@@ -80,17 +79,16 @@ async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
         log("[playwright] missing sitekey", C.RED)
         return None
 
-    # 1. تخطي الـ DNS
     ip_addr = await _get_hcaptcha_ip()
     if not ip_addr:
         return None
 
-    # 2. جلب السكريبت من الـ IP مباشرة
-    log("[curl_cffi] Downloading script from direct IP...", C.GOLD)
+    log("[curl_cffi] Downloading script from direct IP (ignoring SSL)...", C.GOLD)
     hc_script_text = ""
     session = AsyncSession(impersonate="chrome", timeout=15)
     try:
-        r = await session.get(f"https://{ip_addr}/1/api.js?render=explicit", headers={"Host": "js.hcaptcha.com"})
+        # التعديل هنا: إضافة verify=False
+        r = await session.get(f"https://{ip_addr}/1/api.js?render=explicit", headers={"Host": "js.hcaptcha.com"}, verify=False)
         if r.status_code == 200:
             hc_script_text = r.text
             log(f"[curl_cffi] Script downloaded ({len(hc_script_text)} bytes)", C.LIME)
