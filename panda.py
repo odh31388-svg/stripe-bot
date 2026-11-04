@@ -58,7 +58,6 @@ def is_param_error(msg):
     return ("unknown parameter" in m or "parameter_unknown" in m
             or "received unknown" in m or "did you mean" in m)
 
-# --- دالة Playwright عبر Node.js ---
 async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
     if not sitekey:
         log("[playwright] missing sitekey", C.RED)
@@ -80,12 +79,11 @@ async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
     if not hc_script_text:
         return None
 
-    # حفظ السكريبت
-    hc_file_path = "/tmp/hc_script.js"
+    # حفظ السكريبت في نفس فولدر المشروع عشان node يلاقي مكتبة playwright
+    hc_file_path = "hc_script.js"
     with open(hc_file_path, "w") as f:
         f.write(hc_script_text)
 
-    # سكريبت Node.js
     node_script = """
     const { chromium } = require('playwright');
     const fs = require('fs');
@@ -131,7 +129,8 @@ async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
         }
     })();
     """
-    node_file_path = "/tmp/solver.js"
+    # نفس الحاجة هنا، نحفظ الملف في الفولدر الحالي
+    node_file_path = "solver.js"
     with open(node_file_path, "w") as f:
         f.write(node_script)
 
@@ -164,7 +163,6 @@ async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
     except Exception as e:
         log(f"[playwright] EXC: {str(e)}", C.RED)
         return None
-# ------------------------------------------
 
 _SRC_PREFIXES = ("src_", "tdsrc_", "pi_3ds_")
 def _is_src(v): return isinstance(v, str) and any(v.startswith(p) for p in _SRC_PREFIXES)
