@@ -90,63 +90,75 @@ async def _run_nodriver_hcaptcha(checkout_url, rqdata=None, sitekey=None):
 
     browser = None
     try:
+        # 1. جلب السكريبت باستخدام curl_cffi (لأنه شغال ومش محجوب)
+        log("[nodriver] Downloading hCaptcha script via curl_cffi...", C.GOLD)
+        hc_script_text = ""
+        session = AsyncSession(impersonate="chrome", timeout=15)
+        try:
+            r = await session.get("https://js.hcaptcha.com/1/api.js?render=explicit")
+            if r.status_code == 200:
+                hc_script_text = r.text
+                log(f"[curl_cffi] Script downloaded ({len(hc_script_text)} bytes)", C.LIME)
+        except Exception as e:
+            log(f"[curl_cffi] Error: {e}", C.RED)
+        finally:
+            await session.close()
+
+        if not hc_script_text:
+            log("[nodriver] Cannot proceed without script", C.RED)
+            return None
+
+        # تحويل السكريبت لـ base64 عشان نستخدمه في الفكرة التانية
+        hc_b64 = base64.b64encode(hc_script_text.encode()).decode()
+
+        # 2. تشغيل المتصفح وتجهيزه
         browser = await _start_browser_with_retry(browser_args)
-        page = await browser.get(checkout_url)
-        await page.sleep(1)
         
-        # --- فكرة الاعتراض الجديدة ---
-        log("[nodriver] Enabling CDP Network Interception...", C.GOLD)
-        await page.send(cdp.fetch.enable(patterns=[cdp.fetch.RequestPattern(url_pattern="*hcaptcha*")]))
-        
-        async def on_request_paused(event: cdp.fetch.RequestPaused):
-            try:
-                req_url = event.request.url
-                if "js.hcaptcha.com" in req_url:
-                    log(f"[CDP] Intercepted: {req_url}", C.CYN)
-                    # جلب السكريبت بـ curl_cffi
-                    s = AsyncSession(impersonate="chrome", timeout=15)
-                    try:
-                        r = await s.get(req_url)
-                        if r.status_code == 200:
-                            body_b64 = base64.b64encode(r.content).decode('utf-8')
-                            # حقن الرد في المتصفح
-                            await page.send(cdp.fetch.fulfill_request(
-                                request_id=event.request_id,
-                                response_code=200,
-                                response_headers=[{"name": "Content-Type", "value": "application/javascript"}],
-                                body=body_b64
-                            ))
-                            log("[CDP] Script fulfilled successfully!", C.LIME)
-                        else:
-                            log(f"[CDP] curl_cffi status {r.status_code}", C.RED)
-                            await page.send(cdp.fetch.continue_request(request_id=event.request_id))
-                    except Exception as e:
-                        log(f"[CDP] Fetch error: {e}", C.RED)
-                        await page.send(cdp.fetch.continue_request(request_id=event.request_id))
-                    finally:
-                        await s.close()
-                else:
-                    # استكمال الطلبات التانية عادي
-                    await page.send(cdp.fetch.continue_request(request_id=event.request_id))
-            except Exception as e:
-                log(f"[CDP] Intercept handler error: {e}", C.RED)
-
-        page.add_handler(cdp.fetch.RequestPaused, on_request_paused)
-        # ------------------------------
-
-        # استنى شوية عشان السكريبت يتحمل ويعمل setup
-        await page.sleep(3)
-
+        # الفكرة الأولى: كسر الـ CSP وحقن السكريبت قبل تحميل أي صفحة
+        page = await browser.get("about:blank")
         try:
             await page.send(cdp.page.set_bypass_csp(enabled=True))
-        except: pass
+            # حقن السكريبت عشان يشتغل مع أي صفحة جديدة
+            await page.send(cdp.page.add_script_to_evaluate_on_new_document(source=hc_script_text))
+            log("[nodriver] Idea 1: Injected script on new document!", C.LIME)
+        except Exception as e:
+            log(f"[nodriver] Idea 1 failed: {e}", C.YEL)
 
+        # 3. فتح صفحة Stripe
+        page = await browser.get(checkout_url)
+        await page.sleep(2)
+
+        # التحقق من وجود hcaptcha
         hc_loaded = await page.evaluate("typeof hcaptcha !== 'undefined' && hcaptcha.render")
+        
+        # الفكرة التانية: لو مش موجود، نحقنه كـ Data URI
         if not hc_loaded:
-            log("[nodriver] hCaptcha still undefined after CDP intercept.", C.RED)
+            log("[nodriver] Idea 2: Trying Data URI injection...", C.YEL)
+            await page.evaluate(f"""
+                const s = document.createElement('script');
+                s.src = 'data:text/javascript;base64,{hc_b64}';
+                document.head.appendChild(s);
+            """)
+            await page.sleep(2)
+            hc_loaded = await page.evaluate("typeof hcaptcha !== 'undefined' && hcaptcha.render")
+
+        # الفكرة التالتة: لو لسه مش موجود، نحقنه كـ Inline Script مباشر
+        if not hc_loaded:
+            log("[nodriver] Idea 3: Trying Direct Inline injection...", C.YEL)
+            await page.evaluate(f"""
+                const s = document.createElement('script');
+                s.type = 'text/javascript';
+                s.text = {json.dumps(hc_script_text)};
+                document.head.appendChild(s);
+            """)
+            await page.sleep(2)
+            hc_loaded = await page.evaluate("typeof hcaptcha !== 'undefined' && hcaptcha.render")
+
+        if not hc_loaded:
+            log("[nodriver] ALL 3 IDEAS FAILED to load hcaptcha.", C.RED)
             return None
         
-        log("[nodriver] hCaptcha loaded via CDP!", C.LIME)
+        log("[nodriver] hCaptcha loaded successfully via one of the new ideas!", C.LIME)
 
         rq_safe = (rqdata or "").replace("\\", "\\\\").replace("'", "\\'")
         sk_safe = sitekey.replace("'", "\\'")
