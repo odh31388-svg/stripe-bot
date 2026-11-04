@@ -79,7 +79,6 @@ async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
     if not hc_script_text:
         return None
 
-    # حفظ السكريبت في نفس فولدر المشروع عشان node يلاقي مكتبة playwright
     hc_file_path = "hc_script.js"
     with open(hc_file_path, "w") as f:
         f.write(hc_script_text)
@@ -101,12 +100,12 @@ async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
                 args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
             });
             const page = await browser.newPage();
-            await page.route('**/js.hcaptcha.com/**', route => {
-                route.fulfill({ status: 200, contentType: 'application/javascript', body: hc_script });
-            });
+            
+            // الفكرة الجديدة: حقن السكريبت قبل تحميل الصفحة
+            await page.addInitScript(hc_script);
             
             await page.goto(url, { waitUntil: 'domcontentloaded' });
-            await page.waitForTimeout(2000);
+            await page.waitForTimeout(3000);
             
             const token = await page.evaluate(async ({sitekey, rqdata}) => {
                 if (typeof hcaptcha === 'undefined') return 'undefined_hcaptcha';
@@ -129,7 +128,6 @@ async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
         }
     })();
     """
-    # نفس الحاجة هنا، نحفظ الملف في الفولدر الحالي
     node_file_path = "solver.js"
     with open(node_file_path, "w") as f:
         f.write(node_script)
