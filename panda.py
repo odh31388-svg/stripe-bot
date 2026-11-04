@@ -90,8 +90,8 @@ async def _run_nodriver_hcaptcha(checkout_url, rqdata=None, sitekey=None):
 
     browser = None
     try:
-        # 1. جلب السكريبت باستخدام curl_cffi (لأنه شغال ومش محجوب)
-        log("[nodriver] Downloading hCaptcha script via curl_cffi...", C.GOLD)
+        # 1. جلب السكريبت باستخدام curl_cffi
+        log("[curl_cffi] Downloading hCaptcha script...", C.GOLD)
         hc_script_text = ""
         session = AsyncSession(impersonate="chrome", timeout=15)
         try:
@@ -105,60 +105,66 @@ async def _run_nodriver_hcaptcha(checkout_url, rqdata=None, sitekey=None):
             await session.close()
 
         if not hc_script_text:
-            log("[nodriver] Cannot proceed without script", C.RED)
             return None
 
-        # تحويل السكريبت لـ base64 عشان نستخدمه في الفكرة التانية
+        # تحويل السكريبت لـ base64 عشان نستخدمه في الحقن
         hc_b64 = base64.b64encode(hc_script_text.encode()).decode()
 
-        # 2. تشغيل المتصفح وتجهيزه
+        # 2. تشغيل المتصفح
         browser = await _start_browser_with_retry(browser_args)
+        page = await browser.get(checkout_url)
         
-        # الفكرة الأولى: كسر الـ CSP وحقن السكريبت قبل تحميل أي صفحة
-        page = await browser.get("about:blank")
+        # كسر الحماية
         try:
             await page.send(cdp.page.set_bypass_csp(enabled=True))
-            # حقن السكريبت عشان يشتغل مع أي صفحة جديدة
-            await page.send(cdp.page.add_script_to_evaluate_on_new_document(source=hc_script_text))
-            log("[nodriver] Idea 1: Injected script on new document!", C.LIME)
-        except Exception as e:
-            log(f"[nodriver] Idea 1 failed: {e}", C.YEL)
+        except: pass
 
-        # 3. فتح صفحة Stripe
-        page = await browser.get(checkout_url)
-        await page.sleep(2)
-
-        # التحقق من وجود hcaptcha
-        hc_loaded = await page.evaluate("typeof hcaptcha !== 'undefined' && hcaptcha.render")
+        await page.sleep(1)
         
-        # الفكرة التانية: لو مش موجود، نحقنه كـ Data URI
-        if not hc_loaded:
-            log("[nodriver] Idea 2: Trying Data URI injection...", C.YEL)
-            await page.evaluate(f"""
-                const s = document.createElement('script');
-                s.src = 'data:text/javascript;base64,{hc_b64}';
+        # الفكرة الجديدة 1: استخدام Blob URL
+        log("[nodriver] Idea 1: Blob URL Injection...", C.GOLD)
+        js_blob = f"""
+        (function() {{
+            try {{
+                var b64 = "{hc_b64}";
+                var bin = atob(b64);
+                var bytes = new Uint8Array(bin.length);
+                for (var i = 0; i < bin.length; i++) {{ bytes[i] = bin.charCodeAt(i); }}
+                var blob = new Blob([bytes], {{type: 'application/javascript'}});
+                var url = URL.createObjectURL(blob);
+                var s = document.createElement('script');
+                s.src = url;
                 document.head.appendChild(s);
-            """)
+                console.log("Blob injected successfully.");
+            }} catch(e) {{
+                console.error("Blob inject error: " + e);
+            }}
+        }})();
+        """
+        await page.evaluate(js_blob)
+        await page.sleep(2)
+        hc_loaded = await page.evaluate("typeof hcaptcha !== 'undefined' && hcaptcha.render")
+
+        # الفكرة الجديدة 2: استخدام window.eval()
+        if not hc_loaded:
+            log("[nodriver] Idea 2: window.eval() Injection...", C.YEL)
+            js_eval = f"""
+            try {{
+                window.eval({json.dumps(hc_script_text)});
+                console.log("Eval executed.");
+            }} catch(e) {{
+                console.error("Eval error: " + e);
+            }}
+            """
+            await page.evaluate(js_eval)
             await page.sleep(2)
             hc_loaded = await page.evaluate("typeof hcaptcha !== 'undefined' && hcaptcha.render")
 
-        # الفكرة التالتة: لو لسه مش موجود، نحقنه كـ Inline Script مباشر
         if not hc_loaded:
-            log("[nodriver] Idea 3: Trying Direct Inline injection...", C.YEL)
-            await page.evaluate(f"""
-                const s = document.createElement('script');
-                s.type = 'text/javascript';
-                s.text = {json.dumps(hc_script_text)};
-                document.head.appendChild(s);
-            """)
-            await page.sleep(2)
-            hc_loaded = await page.evaluate("typeof hcaptcha !== 'undefined' && hcaptcha.render")
-
-        if not hc_loaded:
-            log("[nodriver] ALL 3 IDEAS FAILED to load hcaptcha.", C.RED)
+            log("[nodriver] ALL NEW IDEAS FAILED to load hcaptcha.", C.RED)
             return None
         
-        log("[nodriver] hCaptcha loaded successfully via one of the new ideas!", C.LIME)
+        log("[nodriver] hCaptcha loaded successfully via new ideas!", C.LIME)
 
         rq_safe = (rqdata or "").replace("\\", "\\\\").replace("'", "\\'")
         sk_safe = sitekey.replace("'", "\\'")
