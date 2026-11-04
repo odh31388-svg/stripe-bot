@@ -98,34 +98,17 @@ def is_param_error(msg):
 def _create_proxy_auth_folder(host, port, user, pw):
     ext_dir = os.path.join(tempfile.gettempdir(), f"pxauth_{host}_{port}")
     os.makedirs(ext_dir, exist_ok=True)
-
-    manifest_json = ('{"version": "1.0.0", "manifest_version": 2, '
-        '"name": "Chrome Proxy", '
+    manifest_json = ('{"version": "1.0.0", "manifest_version": 2, "name": "Chrome Proxy", '
         '"permissions": ["proxy","tabs","unlimitedStorage","storage","<all_urls>","webRequest","webRequestBlocking"], '
         '"background": {"scripts": ["background.js"]}, "minimum_chrome_version":"22.0.0"}')
-
     background_js = '''
-    var config = {
-      mode: "fixed_servers",
-      rules: {
-        singleProxy: { scheme: "http", host: "%s", port: parseInt(%s) },
-        bypassList: ["localhost"]
-      }
-    };
+    var config = { mode: "fixed_servers", rules: { singleProxy: { scheme: "http", host: "%s", port: parseInt(%s) }, bypassList: ["localhost"] } };
     chrome.proxy.settings.set({value: config, scope: "regular"}, function() {});
-    function callbackFn(details) {
-      return { authCredentials: { username: "%s", password: "%s" } };
-    }
-    chrome.webRequest.onAuthRequired.addListener(
-      callbackFn, {urls: ["<all_urls>"]}, ['blocking']
-    );
+    function callbackFn(details) { return { authCredentials: { username: "%s", password: "%s" } }; }
+    chrome.webRequest.onAuthRequired.addListener(callbackFn, {urls: ["<all_urls>"]}, ['blocking']);
     ''' % (host, port, user, pw)
-
-    with open(os.path.join(ext_dir, "manifest.json"), "w") as f:
-        f.write(manifest_json)
-    with open(os.path.join(ext_dir, "background.js"), "w") as f:
-        f.write(background_js)
-
+    with open(os.path.join(ext_dir, "manifest.json"), "w") as f: f.write(manifest_json)
+    with open(os.path.join(ext_dir, "background.js"), "w") as f: f.write(background_js)
     return ext_dir
 
 async def _start_browser_with_retry(proxy_entry, browser_args):
@@ -133,11 +116,7 @@ async def _start_browser_with_retry(proxy_entry, browser_args):
     for attempt in range(1, 4):
         try:
             log(f"[nodriver] starting browser (attempt {attempt}/3)...", C.YEL)
-            browser = await uc.start(
-                browser_executable_path='/usr/bin/chromium-browser',
-                browser_args=browser_args,
-                sandbox=False,
-            )
+            browser = await uc.start(browser_executable_path='/usr/bin/chromium-browser', browser_args=browser_args, sandbox=False)
             log("[nodriver] browser connected successfully!", C.LIME)
             return browser
         except Exception as e:
@@ -148,7 +127,7 @@ async def _start_browser_with_retry(proxy_entry, browser_args):
 
 async def _run_nodriver_hcaptcha(checkout_url, proxy_entry=None, rqdata=None, sitekey=None):
     if not sitekey:
-        log("[nodriver] missing sitekey — cannot solve", C.RED)
+        log("[nodriver] missing sitekey", C.RED)
         return None
 
     browser_args = [
@@ -164,80 +143,84 @@ async def _run_nodriver_hcaptcha(checkout_url, proxy_entry=None, rqdata=None, si
         parsed = urlparse(proxy_entry["url"])
         if proxy_entry.get("auth"):
             ext_dir = _create_proxy_auth_folder(parsed.hostname, parsed.port, proxy_entry["auth"][0], proxy_entry["auth"][1])
-            browser_args.append(f"--load-extension={ext_dir}")
-            browser_args.append(f"--disable-extensions-except={ext_dir}")
+            browser_args.extend([f"--load-extension={ext_dir}", f"--disable-extensions-except={ext_dir}"])
         else:
             browser_args.append(f"--proxy-server={proxy_entry['url']}")
 
     browser = None
     try:
         browser = await _start_browser_with_retry(proxy_entry, browser_args)
-        
-        # تفعيل تجاوز حماية CSP
         page = await browser.get(checkout_url)
+        
+        # تفعيل مراقبة الشبكة
+        await page.send(cdp.network.enable())
+        async def on_req_failed(e: cdp.network.LoadingFailed):
+            log(f"[NET_FAIL] {e.error_text} - Blocked by proxy/network", C.RED)
+        async def on_resp_recv(e: cdp.network.ResponseReceived):
+            if e.response.status >= 400:
+                log(f"[NET_{e.response.status}] {e.response.url}", C.RED)
+        page.add_handler(cdp.network.LoadingFailed, on_req_failed)
+        page.add_handler(cdp.network.ResponseReceived, on_resp_recv)
+
+        # كسر حماية CSP
         try:
             await page.send(cdp.page.set_bypass_csp(enabled=True))
             log("[nodriver] CSP bypass enabled!", C.LIME)
-        except Exception as e:
-            log(f"[nodriver] CSP bypass failed: {e}", C.YEL)
+        except Exception as e: log(f"[nodriver] CSP bypass failed: {e}", C.YEL)
 
         await page.sleep(2)
-
         rq_safe = (rqdata or "").replace("\\", "\\\\").replace("'", "\\'")
         sk_safe = sitekey.replace("'", "\\'")
 
+        # فحص إذا كان hCaptcha موجود مسبقاً
+        hc_loaded = await page.evaluate("typeof hcaptcha !== 'undefined' && hcaptcha.render")
+        
+        if not hc_loaded:
+            log("[nodriver] hCaptcha missing, injecting via browser...", C.YEL)
+            await page.evaluate("""
+                const s = document.createElement('script');
+                s.src = 'https://js.hcaptcha.com/1/api.js?render=explicit';
+                document.head.appendChild(s);
+            """)
+            await page.sleep(3)
+            hc_loaded = await page.evaluate("typeof hcaptcha !== 'undefined' && hcaptcha.render")
+
+        # الخطة البديلة: تحميل السكريبت بـ curl_cffi لو المتصفح فشل
+        if not hc_loaded:
+            log("[nodriver] Browser failed to load script! Trying curl_cffi injection...", C.GOLD)
+            session = AsyncSession(impersonate="chrome", **self._proxy_kwargs())
+            try:
+                r = await session.get("https://js.hcaptcha.com/1/api.js?render=explicit")
+                if r.status_code == 200:
+                    await page.evaluate(r.text)
+                    log("[nodriver] Script injected via curl_cffi successfully!", C.LIME)
+                else:
+                    log(f"[nodriver] curl_cffi script fetch failed: {r.status_code}", C.RED)
+            except Exception as e:
+                log(f"[nodriver] curl_cffi exception: {e}", C.RED)
+            finally:
+                await session.close()
+            await page.sleep(1)
+
         js = f"""
         (async () => {{
-            function waitFor(condition, timeout, interval) {{
-                return new Promise((resolve, reject) => {{
-                    const start = Date.now();
-                    const check = () => {{
-                        try {{ if (condition()) return resolve(true); }} catch(e) {{}}
-                        if (Date.now() - start > timeout) return reject('timeout');
-                        setTimeout(check, interval);
-                    }};
-                    check();
-                }});
-            }}
-
-            try {{
-                await waitFor(() => typeof hcaptcha !== 'undefined' && hcaptcha.render, 5000, 500);
-            }} catch(e) {{
-                try {{
-                    await new Promise((res, rej) => {{
-                        const s = document.createElement('script');
-                        s.src = 'https://js.hcaptcha.com/1/api.js?render=explicit';
-                        s.onload = res;
-                        s.onerror = () => rej('script_failed_to_load_status_' + (window.__hc_err || 'unknown'));
-                        document.head.appendChild(s);
-                    }});
-                    await waitFor(() => typeof hcaptcha !== 'undefined' && hcaptcha.render, 10000, 500);
-                }} catch(e2) {{
-                    return 'err_loading_hcaptcha: ' + (e2.message || e2.toString());
-                }}
-            }}
-
+            if (typeof hcaptcha === 'undefined') return 'still_undefined_after_all_tries';
             try {{
                 let existing = hcaptcha.getResponse();
                 if (existing && existing.length > 20) return existing;
             }} catch(e) {{}}
-
             return await new Promise((resolve, reject) => {{
                 const holder = document.createElement('div');
                 holder.id = '__hc_holder_' + Date.now();
                 document.body.appendChild(holder);
                 let done = false;
                 const t = setTimeout(() => {{ if (!done) {{ done = true; reject('execution_timeout_25s'); }} }}, 25000);
-                
                 try {{
                     const wid = hcaptcha.render(holder, {{
-                        sitekey: '{sk_safe}',
-                        size: 'invisible',
-                        rqdata: '{rq_safe}',
+                        sitekey: '{sk_safe}', size: 'invisible', rqdata: '{rq_safe}',
                         callback: (tok) => {{ if (done) return; done = true; clearTimeout(t); resolve(tok); }},
                         'error-callback': (e) => {{ if (done) return; done = true; clearTimeout(t); reject('hcaptcha_error_callback: ' + e); }}
                     }});
-                    
                     hcaptcha.execute(wid, {{rqdata: '{rq_safe}'}}).catch(e => {{
                         if (!done) {{ done = true; clearTimeout(t); reject('execute_rejection: ' + (e.message || e.toString())); }}
                     }});
@@ -249,36 +232,9 @@ async def _run_nodriver_hcaptcha(checkout_url, proxy_entry=None, rqdata=None, si
         """
 
         token = await page.evaluate(js, await_promise=True, return_by_value=True)
-
         if token and isinstance(token, str) and len(token) > 20 and not token.startswith("err_"):
             log(f"[nodriver] token OK ({len(token)} chars)", C.LIME)
             return token
-        
-        # لو فشل تحميل السكريبت، هنجرب نعمله inject بطريقة تانية
-        if token and "script_failed_to_load" in str(token):
-            log(f"[nodriver] Script load failed. Trying alternative injection...", C.YEL)
-            await page.evaluate("""
-                const script = document.createElement('script');
-                script.src = 'https://js.hcaptcha.com/1/api.js?render=explicit';
-                document.head.appendChild(script);
-            """)
-            await page.sleep(3)
-            token = await page.evaluate(f"""
-                (async () => {{
-                    if (typeof hcaptcha === 'undefined') return 'still_undefined';
-                    return await new Promise((resolve) => {{
-                        const wid = hcaptcha.render(document.createElement('div'), {{
-                            sitekey: '{sk_safe}', size: 'invisible', rqdata: '{rq_safe}',
-                            callback: (tok) => resolve(tok)
-                        }});
-                        hcaptcha.execute(wid);
-                    }});
-                }})()
-            """, await_promise=True, return_by_value=True)
-            if token and len(str(token)) > 20 and token != 'still_undefined':
-                log(f"[nodriver] token OK via alternative ({len(token)} chars)", C.LIME)
-                return token
-
         log(f"[nodriver] token invalid: {str(token)}", C.RED)
         return None
     except Exception as e:
@@ -295,6 +251,14 @@ async def _run_nodriver_hcaptcha(checkout_url, proxy_entry=None, rqdata=None, si
         if ext_dir and os.path.exists(ext_dir):
             try: shutil.rmtree(ext_dir, ignore_errors=True)
             except Exception: pass
+
+    def _proxy_kwargs(self):
+        if not self._proxy: return {}
+        kw = {}; url = self._proxy["url"]; auth = self._proxy.get("auth")
+        if auth and isinstance(auth, (tuple, list)) and len(auth) == 2:
+            url = url.replace("http://", f"http://{auth[0]}:{auth[1]}@")
+        kw["proxy"] = url
+        return kw
 
 async def solve_hcaptcha_selenium(checkout_url, proxy_entry=None, rqdata=None, sitekey=None):
     return await _run_nodriver_hcaptcha(checkout_url, proxy_entry, rqdata, sitekey)
@@ -369,19 +333,13 @@ class StripeSession:
         self.session = AsyncSession(impersonate="chrome", **self._proxy_kwargs())
         
         try:
-            await self.session.get(f"https://checkout.stripe.com/c/pay/{self.cs}",
-                headers={**self._hdrs(), "accept": "text/html,*/*"})
+            await self.session.get(f"https://checkout.stripe.com/c/pay/{self.cs}", headers={**self._hdrs(), "accept": "text/html,*/*"})
         except: pass
         
         async def do_telemetry():
             try:
-                tel = {"v":2,"tag":"5.6.8_js_fp","src":"checkout-inner-live-v3","a":{
-                    "a": self.pk, "b": f"https://checkout.stripe.com/c/pay/{self.cs}",
-                    "c": 24, "d": "1920x1080", "e": False, "f": "en-US", "g": "Win32",
-                    "h": UA, "i": -300, "j": False, "k": 8, "l": 8}}
-                r = await self.session.post("https://m.stripe.com/6", json=tel,
-                    headers={"content-type":"application/json","origin":"https://js.stripe.com",
-                             "referer":"https://js.stripe.com/","user-agent":UA})
+                tel = {"v":2,"tag":"5.6.8_js_fp","src":"checkout-inner-live-v3","a":{"a": self.pk, "b": f"https://checkout.stripe.com/c/pay/{self.cs}","c": 24, "d": "1920x1080", "e": False, "f": "en-US", "g": "Win32","h": UA, "i": -300, "j": False, "k": 8, "l": 8}}
+                r = await self.session.post("https://m.stripe.com/6", json=tel, headers={"content-type":"application/json","origin":"https://js.stripe.com","referer":"https://js.stripe.com/","user-agent":UA})
                 if r.status_code == 200:
                     j = r.json()
                     for k in ("muid","sid","guid"):
@@ -391,8 +349,7 @@ class StripeSession:
         async def do_init():
             try:
                 body = f"key={self.pk}&eid=NA&browser_locale=en-US&redirect_type=url"
-                r = await self.session.post(f"https://api.stripe.com/v1/payment_pages/{self.cs}/init",
-                    headers=self._hdrs(), data=body)
+                r = await self.session.post(f"https://api.stripe.com/v1/payment_pages/{self.cs}/init", headers=self._hdrs(), data=body)
                 return r.json()
             except Exception as e: return {"_err": str(e)[:80]}
         
@@ -410,8 +367,7 @@ class StripeSession:
         cu = j.get("customer") or {}; self.email = cu.get("email") or j.get("customer_email") or ""
         ts = j.get("total_summary") or {}; inv = j.get("invoice") or {}
         lig = j.get("line_item_group") or {}; pi = j.get("payment_intent") or {}
-        self.raw_amount = (ts.get("due") or ts.get("total") or inv.get("amount_due")
-                          or inv.get("total") or lig.get("total") or pi.get("amount") or 0)
+        self.raw_amount = (ts.get("due") or ts.get("total") or inv.get("amount_due") or inv.get("total") or lig.get("total") or pi.get("amount") or 0)
         curr = (j.get("currency") or "usd").upper()
         self.amount_str = f"{self.raw_amount/100:.2f} {curr}" if self.raw_amount else "N/A"
         self.init_json = j
@@ -421,8 +377,7 @@ class StripeSession:
             if not passive and isinstance(j.get("account_settings"), dict):
                 passive = j["account_settings"].get("passive_captcha") or {}
             sk = (passive.get("site_key") or passive.get("sitekey") or passive.get("key") or j.get("captcha_site_key"))
-            if sk and isinstance(sk, str) and len(sk) > 10:
-                self.hcaptcha_sitekey = sk
+            if sk and isinstance(sk, str) and len(sk) > 10: self.hcaptcha_sitekey = sk
         except Exception: pass
         return True, None
 
@@ -437,8 +392,7 @@ class StripeSession:
             "billing_details[address][city]": "New York", "billing_details[address][postal_code]": "10001",
             "billing_details[address][state]": "NY", "payment_user_agent": SJUA,
             "time_on_page": str(random.randint(45000, 120000)),
-            "guid": self.tracking["guid"], "muid": self.tracking["muid"],
-            "sid": self.tracking["sid"], "key": self.pk,
+            "guid": self.tracking["guid"], "muid": self.tracking["muid"], "sid": self.tracking["sid"], "key": self.pk,
         }
         if self.cs and self.cs.startswith("cs_"):
             data["client_attribution_metadata[client_session_id]"] = self.cs
@@ -496,22 +450,8 @@ class StripeSession:
         return last_err or {"error": {"message": "all failed"}}, "ALL_FAILED"
 
     async def _authenticate_source(self, source, client_secret):
-        data = {
-            "key": self.pk, "source": source, "client_secret": client_secret,
-            "payment_user_agent": SJUA, "one_click_authn": "false", "challenge_window_size": "05",
-            "three_d_secure_2[device_render_options][sdk_interface]": "03",
-            "three_d_secure_2[device_render_options][sdk_ui_type][0]": "01",
-            "three_d_secure_2[three_ds_comp_ind]": "Y", "browser[fingerprintAttempted]": "true",
-            "browser[challengeWindowSize]": "05", "browser[threeDSCompInd]": "Y",
-            "browser[browserJavaEnabled]": "false", "browser[browserJavascriptEnabled]": "true",
-            "browser[browserLanguage]": "en-US", "browser[browserColorDepth]": "24",
-            "browser[browserScreenHeight]": "1080", "browser[browserScreenWidth]": "1920",
-            "browser[browserTZ]": "-300", "browser[browserUserAgent]": UA,
-            "browser[browserAcceptHeader]": "text/html,*/*;q=0.8",
-        }
-        hdr = {"accept":"application/json","content-type":"application/x-www-form-urlencoded",
-               "origin":"https://js.stripe.com","referer":"https://js.stripe.com/",
-               "user-agent":UA,"stripe-version":STRIPE_VER}
+        data = {"key": self.pk, "source": source, "client_secret": client_secret, "payment_user_agent": SJUA, "one_click_authn": "false", "challenge_window_size": "05", "three_d_secure_2[device_render_options][sdk_interface]": "03", "three_d_secure_2[device_render_options][sdk_ui_type][0]": "01", "three_d_secure_2[three_ds_comp_ind]": "Y", "browser[fingerprintAttempted]": "true", "browser[challengeWindowSize]": "05", "browser[threeDSCompInd]": "Y", "browser[browserJavaEnabled]": "false", "browser[browserJavascriptEnabled]": "true", "browser[browserLanguage]": "en-US", "browser[browserColorDepth]": "24", "browser[browserScreenHeight]": "1080", "browser[browserScreenWidth]": "1920", "browser[browserTZ]": "-300", "browser[browserUserAgent]": UA, "browser[browserAcceptHeader]": "text/html,*/*;q=0.8"}
+        hdr = {"accept":"application/json","content-type":"application/x-www-form-urlencoded","origin":"https://js.stripe.com","referer":"https://js.stripe.com/","user-agent":UA,"stripe-version":STRIPE_VER}
         try:
             r = await self.session.post("https://api.stripe.com/v1/3ds2/authenticate", data=data, headers=hdr, timeout=15)
             return r.json()
@@ -581,8 +521,7 @@ class StripeSession:
             pl = {"threeDSServerTransID": stid, "threeDSMethodNotificationURL": notify_url}
             mb = b64e(json.dumps(pl, separators=(",",":")).encode())
             try:
-                await self.session.post(method_url, data=urlencode({"threeDSMethodData": mb}),
-                    headers={"content-type":"application/x-www-form-urlencoded","user-agent":UA})
+                await self.session.post(method_url, data=urlencode({"threeDSMethodData": mb}), headers={"content-type":"application/x-www-form-urlencoded","user-agent":UA})
             except: pass
             await asyncio.sleep(0.8)
         src = source or find_source_recursive(sdk) or find_source_recursive(conf)
