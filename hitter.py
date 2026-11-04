@@ -1,7 +1,7 @@
 # ═══════════════════════════════════════════════════════════════════════════
-#  DELUXE ADYEN BYPASS ENGINE — v9 ARABIC BIDI FIX
-#  · Fixed for curl_cffi 0.17.0 (Horus/Alpine compatible)
-#  · BiDi Reversed Arabic Interface
+#  DELUXE ADYEN BYPASS ENGINE — v9 ARABIC BIDI FIX + SPACING
+#  · Fixed internal_error in Termux
+#  · Character-spaced Arabic for perfect readability
 # ═══════════════════════════════════════════════════════════════════════════
 
 import os
@@ -36,20 +36,23 @@ IMPERSONATE_POOL = [
 ]
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  ARABIC BIDI FIX — يحل مشكلة تقليب العربي في Termux
+#  ARABIC BIDI FIX + CHARACTER SPACING
 # ═══════════════════════════════════════════════════════════════════════════
 def ar(text: str) -> str:
     """
-    يعكس النص العربي عشان يطلع صح في Termux.
-    لو طلع مقلوب بالعكس، غير السطر اللي جوه:
-      return line[::-1]   ->   return line
+    يعكس النص العربي ويضيف مسافات دقيقة بين الحروف
+    عشان يطلع واضح ومقروء في Termux.
     """
     if not text:
         return text
     try:
         out_lines = []
         for line in str(text).split('\n'):
-            out_lines.append(line[::-1])
+            # 1. إضافة مسافة رقيقة جداً بين الحروف (Hair Space) لمنع التقليب
+            #    ما بنحطش مسافة عادية عشان الكلمة متتقطعش
+            spaced = "\u200a".join(list(line))
+            # 2. عكس النص عشان الـ BiDi في Termux يقراه صح
+            out_lines.append(spaced[::-1])
         return '\n'.join(out_lines)
     except Exception:
         return str(text)
@@ -1040,18 +1043,22 @@ def choose_source() -> List[dict]:
 
 def ask_int(prompt_txt: str, default: int) -> int:
     while True:
-        s = prompt(prompt_txt, C.CYAN).strip()
-        if not s: return default
         try:
+            s = prompt(prompt_txt, C.CYAN).strip()
+            if not s: return default
             v = int(s)
             if v > 0: return v
-        except ValueError: pass
+        except (ValueError, Exception):
+            pass
         log_err("أدخل رقم صحيح موجب")
 
 def ask_yes_no(prompt_txt: str, default: bool = True) -> bool:
-    s = prompt(f"{prompt_txt} [{'نعم/لا' if default else 'نعم/لا'}]: ", C.CYAN).strip().lower()
-    if not s: return default
-    return s in ("y", "yes", "e", "evet", "نعم")
+    try:
+        s = prompt(f"{prompt_txt} [{'نعم/لا' if default else 'نعم/لا'}]: ", C.CYAN).strip().lower()
+        if not s: return default
+        return s in ("y", "yes", "e", "evet", "نعم")
+    except Exception:
+        return default
 
 async def ask_proxy() -> Optional[dict]:
     hr(); print(f"{C.CYAN}{C.BOLD}{ar('بروكسي (اختياري)')}{C.RESET}")
