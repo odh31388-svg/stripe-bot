@@ -66,42 +66,23 @@ async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
     hc_file_path = "hc_script.js"
     hc_script_text = ""
 
-    # 1. هل السكريبت موجود عندنا من قبل؟
     if os.path.exists(hc_file_path):
         with open(hc_file_path, "r") as f:
             hc_script_text = f.read()
         log("[cache] Loaded hCaptcha script from local cache!", C.LIME)
     else:
-        # 2. لو مش موجود، نجيب من جوجل ترانسليت (مستحيل يتحجب)
-        log("[google] Fetching script via Google Translate Proxy...", C.GOLD)
+        log("[proxy] Fetching script via Google Translate...", C.GOLD)
         session = AsyncSession(impersonate="chrome", timeout=20)
         try:
-            # نستخدم مترجم جوجل كبروكسي عشان يتخطى الحجب
             proxy_url = "https://js-hcaptcha-com.translate.goog/1/api.js?render=explicit&_x_tr_sl=auto&_x_tr_tl=en&_x_tr_hl=en"
             r = await session.get(proxy_url)
             if r.status_code == 200:
                 hc_script_text = r.text
                 with open(hc_file_path, "w") as f:
                     f.write(hc_script_text)
-                log(f"[google] Script fetched and cached ({len(hc_script_text)} bytes)", C.LIME)
+                log(f"[proxy] Script fetched and cached ({len(hc_script_text)} bytes)", C.LIME)
         except Exception as e:
-            log(f"[google] Error: {e}", C.RED)
-        finally:
-            await session.close()
-
-    # 3. لو فشل، نجرب بروكسي تاني
-    if not hc_script_text:
-        log("[proxy2] Trying alternative proxy...", C.GOLD)
-        session = AsyncSession(impersonate="chrome", timeout=15)
-        try:
-            r = await session.get("https://api.codetabs.com/v1/proxy/?quest=https://js.hcaptcha.com/1/api.js")
-            if r.status_code == 200:
-                hc_script_text = r.text
-                with open(hc_file_path, "w") as f:
-                    f.write(hc_script_text)
-                log(f"[proxy2] Script fetched ({len(hc_script_text)} bytes)", C.LIME)
-        except Exception:
-            pass
+            log(f"[proxy] Error: {e}", C.RED)
         finally:
             await session.close()
 
@@ -128,17 +109,26 @@ async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
             const context = await browser.newContext({ bypassCSP: true });
             const page = await context.newPage();
             
-            await page.route('**/*', async (route) => {
+            // مراقبة الكونسول والأخطاء
+            page.on('console', msg => console.log('BROWSER_LOG: ' + msg.text()));
+            page.on('pageerror', err => console.log('BROWSER_ERROR: ' + err.message));
+            
+            await page.route('**/*hcaptcha*', async (route) => {
                 const reqUrl = route.request().url();
-                if (reqUrl.includes('js.hcaptcha.com')) {
+                if (reqUrl.includes('api.js')) {
                     await route.fulfill({ status: 200, contentType: 'application/javascript', body: hc_script });
                 } else {
-                    await route.continue();
+                    // اعتراض طلبات التحدي وهمياً عشان ميعملش Timeout
+                    await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' });
                 }
             });
             
             await page.goto(url, { waitUntil: 'domcontentloaded' });
-            await page.waitForTimeout(3000);
+            await page.waitForTimeout(2000);
+            
+            // حقن مباشر بدون addScriptTag
+            await page.evaluate(hc_script);
+            await page.waitForTimeout(2000);
             
             const token = await page.evaluate(async ({sitekey, rqdata}) => {
                 if (typeof hcaptcha === 'undefined') return 'undefined_hcaptcha';
@@ -154,7 +144,7 @@ async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
                 });
             }, {sitekey, rqdata});
             
-            console.log(token);
+            console.log('FINAL_TOKEN: ' + token);
             await browser.close();
         } catch (e) {
             console.log('NODE_EXC: ' + e.message);
@@ -165,7 +155,7 @@ async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
     with open(node_file_path, "w") as f:
         f.write(node_script)
 
-    log("[playwright] Running Playwright with cached script...", C.GOLD)
+    log("[playwright] Running Playwright with deep inspection...", C.GOLD)
     try:
         process = await asyncio.create_subprocess_exec(
             "node", node_file_path, checkout_url, sitekey, (rqdata or ""), hc_file_path,
@@ -175,11 +165,18 @@ async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
         stdout, stderr = await process.communicate()
         out = stdout.decode().strip()
         
-        if out and len(out) > 50 and not out.startswith("error_") and not out.startswith("NODE_EXC"):
-            log(f"[playwright] token OK ({len(out)} chars)", C.LIME)
-            return out
+        # طباعة لوجات المتصفح عشان نشوف الأخطاء
+        for line in out.split('\n'):
+            if line.startswith('BROWSER_'):
+                log(line, C.CYN)
+        
+        if "FINAL_TOKEN: " in out:
+            token = out.split("FINAL_TOKEN: ")[1].strip()
+            if len(token) > 50 and not token.startswith("error_") and token != "undefined_hcaptcha":
+                log(f"[playwright] token OK ({len(token)} chars)", C.LIME)
+                return token
             
-        log(f"[playwright] result: {out}", C.RED)
+        log(f"[playwright] final result: {out[:200]}", C.RED)
         return None
     except Exception as e:
         log(f"[playwright] EXC: {str(e)}", C.RED)
