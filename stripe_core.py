@@ -1,4 +1,3 @@
-cat << 'EOF' > stripe_core.py
 # language: Python 3.10+, file: stripe_core.py
 import os
 import re
@@ -230,4 +229,3 @@ class StripeSession:
                 await self.session.close()
             except:
                 pass
-EOF
