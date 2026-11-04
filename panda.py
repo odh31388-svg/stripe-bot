@@ -3,15 +3,12 @@ import os, re, sys, json, time, uuid, hmac, base64, random, hashlib, asyncio, se
 import urllib.parse
 from urllib.parse import unquote, urlencode, urljoin, urlparse
 from datetime import datetime
-import tempfile, shutil
 from typing import Any, Dict, Optional
 
 try:
     from curl_cffi.requests import AsyncSession
-    import nodriver as uc
-    from nodriver import cdp
 except ImportError:
-    print("pip install curl-cffi nodriver websockets>=14 --break-system-packages"); sys.exit(1)
+    print("pip install curl-cffi --break-system-packages"); sys.exit(1)
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 SJUA = "stripe.js/da394b0aef; stripe-js-v3/da394b0aef; checkout"
@@ -61,159 +58,113 @@ def is_param_error(msg):
     return ("unknown parameter" in m or "parameter_unknown" in m
             or "received unknown" in m or "did you mean" in m)
 
-async def _start_browser_with_retry(browser_args):
-    last_err = None
-    for attempt in range(1, 4):
-        try:
-            log(f"[nodriver] starting browser (attempt {attempt}/3)...", C.YEL)
-            browser = await uc.start(browser_executable_path='/usr/bin/chromium-browser', browser_args=browser_args, sandbox=False)
-            log("[nodriver] browser connected successfully!", C.LIME)
-            return browser
-        except Exception as e:
-            last_err = e
-            log(f"[nodriver] attempt {attempt} failed: {str(e)[:80]}", C.RED)
-            await asyncio.sleep(3)
-    raise last_err
-
-async def _run_nodriver_hcaptcha(checkout_url, rqdata=None, sitekey=None):
+# --- دالة Playwright عبر Node.js ---
+async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
     if not sitekey:
-        log("[nodriver] missing sitekey", C.RED)
+        log("[playwright] missing sitekey", C.RED)
         return None
 
-    browser_args = [
-        "--headless=new", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
-        "--disable-blink-features=AutomationControlled", "--window-size=1920,1080",
-        "--lang=en-US", "--remote-debugging-port=9222", "--disable-extensions",
-        "--disable-background-networking", "--disable-default-apps", "--disable-sync",
-        "--metrics-recording-only", "--mute-audio", "--no-first-run",
-    ]
-
-    browser = None
+    log("[playwright] Downloading hCaptcha script via curl_cffi...", C.GOLD)
+    hc_script_text = ""
+    session = AsyncSession(impersonate="chrome", timeout=15)
     try:
-        # 1. جلب السكريبت باستخدام curl_cffi
-        log("[curl_cffi] Downloading hCaptcha script...", C.GOLD)
-        hc_script_text = ""
-        session = AsyncSession(impersonate="chrome", timeout=15)
-        try:
-            r = await session.get("https://js.hcaptcha.com/1/api.js?render=explicit")
-            if r.status_code == 200:
-                hc_script_text = r.text
-                log(f"[curl_cffi] Script downloaded ({len(hc_script_text)} bytes)", C.LIME)
-        except Exception as e:
-            log(f"[curl_cffi] Error: {e}", C.RED)
-        finally:
-            await session.close()
+        r = await session.get("https://js.hcaptcha.com/1/api.js?render=explicit")
+        if r.status_code == 200:
+            hc_script_text = r.text
+            log(f"[curl_cffi] Script downloaded ({len(hc_script_text)} bytes)", C.LIME)
+    except Exception as e:
+        log(f"[curl_cffi] Error: {e}", C.RED)
+    finally:
+        await session.close()
 
-        if not hc_script_text:
+    if not hc_script_text:
+        return None
+
+    # حفظ السكريبت
+    hc_file_path = "/tmp/hc_script.js"
+    with open(hc_file_path, "w") as f:
+        f.write(hc_script_text)
+
+    # سكريبت Node.js
+    node_script = """
+    const { chromium } = require('playwright');
+    const fs = require('fs');
+    const url = process.argv[2];
+    const sitekey = process.argv[3];
+    const rqdata = process.argv[4];
+    const hc_file = process.argv[5];
+    const hc_script = fs.readFileSync(hc_file, 'utf8');
+
+    (async () => {
+        try {
+            const browser = await chromium.launch({
+                executablePath: '/usr/bin/chromium-browser',
+                headless: true,
+                args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
+            });
+            const page = await browser.newPage();
+            await page.route('**/js.hcaptcha.com/**', route => {
+                route.fulfill({ status: 200, contentType: 'application/javascript', body: hc_script });
+            });
+            
+            await page.goto(url, { waitUntil: 'domcontentloaded' });
+            await page.waitForTimeout(2000);
+            
+            const token = await page.evaluate(async ({sitekey, rqdata}) => {
+                if (typeof hcaptcha === 'undefined') return 'undefined_hcaptcha';
+                return new Promise((resolve) => {
+                    const holder = document.createElement('div');
+                    document.body.appendChild(holder);
+                    const wid = hcaptcha.render(holder, {
+                        sitekey: sitekey, size: 'invisible', rqdata: rqdata,
+                        callback: (tok) => resolve(tok),
+                        'error-callback': (e) => resolve('error_' + e)
+                    });
+                    hcaptcha.execute(wid, {rqdata: rqdata});
+                });
+            }, {sitekey, rqdata});
+            
+            console.log(token);
+            await browser.close();
+        } catch (e) {
+            console.log('NODE_EXC: ' + e.message);
+        }
+    })();
+    """
+    node_file_path = "/tmp/solver.js"
+    with open(node_file_path, "w") as f:
+        f.write(node_script)
+
+    log("[playwright] Running Node.js Playwright solver...", C.GOLD)
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "node", node_file_path, checkout_url, sitekey, (rqdata or ""), hc_file_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+        
+        out = stdout.decode().strip()
+        err = stderr.decode().strip()
+        
+        if process.returncode != 0:
+            log(f"[playwright] Node process failed: {err[:100]}", C.RED)
             return None
-
-        # تحويل السكريبت لـ base64 عشان نستخدمه في الحقن
-        hc_b64 = base64.b64encode(hc_script_text.encode()).decode()
-
-        # 2. تشغيل المتصفح
-        browser = await _start_browser_with_retry(browser_args)
-        page = await browser.get(checkout_url)
-        
-        # كسر الحماية
-        try:
-            await page.send(cdp.page.set_bypass_csp(enabled=True))
-        except: pass
-
-        await page.sleep(1)
-        
-        # الفكرة الجديدة 1: استخدام Blob URL
-        log("[nodriver] Idea 1: Blob URL Injection...", C.GOLD)
-        js_blob = f"""
-        (function() {{
-            try {{
-                var b64 = "{hc_b64}";
-                var bin = atob(b64);
-                var bytes = new Uint8Array(bin.length);
-                for (var i = 0; i < bin.length; i++) {{ bytes[i] = bin.charCodeAt(i); }}
-                var blob = new Blob([bytes], {{type: 'application/javascript'}});
-                var url = URL.createObjectURL(blob);
-                var s = document.createElement('script');
-                s.src = url;
-                document.head.appendChild(s);
-                console.log("Blob injected successfully.");
-            }} catch(e) {{
-                console.error("Blob inject error: " + e);
-            }}
-        }})();
-        """
-        await page.evaluate(js_blob)
-        await page.sleep(2)
-        hc_loaded = await page.evaluate("typeof hcaptcha !== 'undefined' && hcaptcha.render")
-
-        # الفكرة الجديدة 2: استخدام window.eval()
-        if not hc_loaded:
-            log("[nodriver] Idea 2: window.eval() Injection...", C.YEL)
-            js_eval = f"""
-            try {{
-                window.eval({json.dumps(hc_script_text)});
-                console.log("Eval executed.");
-            }} catch(e) {{
-                console.error("Eval error: " + e);
-            }}
-            """
-            await page.evaluate(js_eval)
-            await page.sleep(2)
-            hc_loaded = await page.evaluate("typeof hcaptcha !== 'undefined' && hcaptcha.render")
-
-        if not hc_loaded:
-            log("[nodriver] ALL NEW IDEAS FAILED to load hcaptcha.", C.RED)
+            
+        if out.startswith("NODE_EXC:"):
+            log(f"[playwright] {out}", C.RED)
             return None
-        
-        log("[nodriver] hCaptcha loaded successfully via new ideas!", C.LIME)
-
-        rq_safe = (rqdata or "").replace("\\", "\\\\").replace("'", "\\'")
-        sk_safe = sitekey.replace("'", "\\'")
-
-        js = f"""
-        (async () => {{
-            try {{
-                let existing = hcaptcha.getResponse();
-                if (existing && existing.length > 50) return existing;
-            }} catch(e) {{}}
-            return await new Promise((resolve, reject) => {{
-                const holder = document.createElement('div');
-                holder.id = '__hc_holder_' + Date.now();
-                document.body.appendChild(holder);
-                let done = false;
-                const t = setTimeout(() => {{ if (!done) {{ done = true; reject('execution_timeout_25s'); }} }}, 25000);
-                try {{
-                    const wid = hcaptcha.render(holder, {{
-                        sitekey: '{sk_safe}', size: 'invisible', rqdata: '{rq_safe}',
-                        callback: (tok) => {{ if (done) return; done = true; clearTimeout(t); resolve(tok); }},
-                        'error-callback': (e) => {{ if (done) return; done = true; clearTimeout(t); reject('hcaptcha_error_callback: ' + e); }}
-                    }});
-                    hcaptcha.execute(wid, {{rqdata: '{rq_safe}'}}).catch(e => {{
-                        if (!done) {{ done = true; clearTimeout(t); reject('execute_rejection: ' + (e.message || e.toString())); }}
-                    }});
-                }} catch(e) {{
-                    if (!done) {{ done = true; clearTimeout(t); reject('render_sync_error: ' + (e.message || e.toString())); }}
-                }}
-            }});
-        }})()
-        """
-
-        token = await page.evaluate(js, await_promise=True, return_by_value=True)
-        if token and isinstance(token, str) and len(token) > 50 and not token.startswith("err_") and not token.startswith("still_"):
-            log(f"[nodriver] token OK ({len(token)} chars)", C.LIME)
-            return token
-        log(f"[nodriver] token invalid: {str(token)}", C.RED)
+            
+        if out and len(out) > 50 and not out.startswith("error_"):
+            log(f"[playwright] token OK ({len(out)} chars)", C.LIME)
+            return out
+            
+        log(f"[playwright] token invalid: {out}", C.RED)
         return None
     except Exception as e:
-        log(f"[nodriver] EXC: {str(e)}", C.RED)
+        log(f"[playwright] EXC: {str(e)}", C.RED)
         return None
-    finally:
-        try:
-            if browser: browser.stop()
-        except Exception: pass
-        try: os.system("pkill -9 -f chromium > /dev/null 2>&1")
-        except Exception: pass
-        try: os.system("pkill -9 -f chrome > /dev/null 2>&1")
-        except Exception: pass
+# ------------------------------------------
 
 _SRC_PREFIXES = ("src_", "tdsrc_", "pi_3ds_")
 def _is_src(v): return isinstance(v, str) and any(v.startswith(p) for p in _SRC_PREFIXES)
@@ -428,9 +379,9 @@ class StripeSession:
                     return {"success": True, "status": "CHARGED", "message": f"Verify ({st})", "raw": r}
         
         if self.cs:
-            log("S4: Nodriver Local Browser", C.GOLD)
+            log("S4: Playwright (Node.js) Browser", C.GOLD)
             checkout_url = f"https://checkout.stripe.com/c/pay/{self.cs}"
-            token = await _run_nodriver_hcaptcha(checkout_url, rqdata, site_key)
+            token = await _run_playwright_hcaptcha(checkout_url, rqdata, site_key)
             if token:
                 log("  Got hCaptcha token! Verifying...", C.LIME)
                 r = await self._verify_challenge(pi_id, cs_secret, token)
@@ -438,7 +389,7 @@ class StripeSession:
                     vpi = r.get("payment_intent") or r.get("setup_intent") or r
                     st = vpi.get("status", "") if isinstance(vpi, dict) else ""
                     if st in ("succeeded","requires_capture","complete"):
-                        return {"success": True, "status": "CHARGED", "message": f"Nodriver ({st})", "raw": r}
+                        return {"success": True, "status": "CHARGED", "message": f"Playwright ({st})", "raw": r}
         return {"success": False, "status": "CAPTCHA_FAIL", "message": "WAF unrecoverable"}
 
     async def _handle_3ds(self, conf, pi, source):
