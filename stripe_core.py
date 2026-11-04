@@ -147,11 +147,20 @@ def _run_selenium_hcaptcha(checkout_url, proxy_entry=None):
     try:
         driver = webdriver.Chrome(service=service, options=opts)
         driver.get(checkout_url)
-        time.sleep(8)
-        token = driver.execute_script("return document.querySelector('[name=\"h-captcha-response\"]')?.value || null;")
+        time.sleep(12) # زدنا الوقت عشان الكابتشا تاخذ راحتها
+        log(f"[Selenium] Page Title: {driver.title}", C.YEL)
+        
+        token = driver.execute_script("""
+            return document.querySelector('[name="h-captcha-response"]')?.value || 
+                   document.querySelector('textarea[name="h-captcha-response"]')?.value || 
+                   document.querySelector('input[name="h-captcha-response"]')?.value || 
+                   null;
+        """)
+        if not token:
+            log(f"[Selenium] Token not found. Body snippet: {driver.page_source[:150]}", C.RED)
         return token
     except Exception as e:
-        log(f"Selenium Error: {e}", C.RED)
+        log(f"[Selenium] EXCEPTION: {e}", C.RED)
         return None
     finally:
         if driver: driver.quit()
