@@ -63,15 +63,36 @@ async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
         log("[playwright] missing sitekey", C.RED)
         return None
 
-    # في الفكرة دي، إحنا هنخلي المتصفح هو اللي يحاول يحل الكابتشا بنفسه، ولو حجب الشبكة، هنطبع الخطأ
-    node_script = """
-    const { chromium } = require('playwright-extra');
-    const stealth = require('puppeteer-extra-plugin-stealth')();
-    chromium.use(stealth);
+    log("[proxy] Fetching hCaptcha script via CORS Proxy...", C.GOLD)
+    hc_script_text = ""
+    session = AsyncSession(impersonate="chrome", timeout=20)
+    try:
+        # استخدام وسيط AllOrigins لجلب السكريبت
+        proxy_url = "https://api.allorigins.win/raw?url=https://js.hcaptcha.com/1/api.js"
+        r = await session.get(proxy_url)
+        if r.status_code == 200:
+            hc_script_text = r.text
+            log(f"[proxy] Script fetched ({len(hc_script_text)} bytes)", C.LIME)
+    except Exception as e:
+        log(f"[proxy] Error: {e}", C.RED)
+    finally:
+        await session.close()
 
+    if not hc_script_text:
+        return None
+
+    hc_file_path = "hc_script.js"
+    with open(hc_file_path, "w") as f:
+        f.write(hc_script_text)
+
+    node_script = """
+    const { chromium } = require('playwright');
+    const fs = require('fs');
     const url = process.argv[2];
     const sitekey = process.argv[3];
     const rqdata = process.argv[4];
+    const hc_file = process.argv[5];
+    const hc_script = fs.readFileSync(hc_file, 'utf8');
 
     (async () => {
         try {
@@ -83,8 +104,18 @@ async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
             const context = await browser.newContext({ bypassCSP: true });
             const page = await context.newPage();
             
+            // اعتراض الطلبات عشان نمرر السكريبت
+            await page.route('**/*', async (route) => {
+                const reqUrl = route.request().url();
+                if (reqUrl.includes('js.hcaptcha.com')) {
+                    await route.fulfill({ status: 200, contentType: 'application/javascript', body: hc_script });
+                } else {
+                    await route.continue();
+                }
+            });
+            
             await page.goto(url, { waitUntil: 'domcontentloaded' });
-            await page.waitForTimeout(4000); // استنى 4 ثواني عشان نتخطى فحص Stripe
+            await page.waitForTimeout(3000);
             
             const token = await page.evaluate(async ({sitekey, rqdata}) => {
                 if (typeof hcaptcha === 'undefined') return 'undefined_hcaptcha';
@@ -111,10 +142,10 @@ async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
     with open(node_file_path, "w") as f:
         f.write(node_script)
 
-    log("[playwright] Running STEALTH Playwright (bypassing radar)...", C.GOLD)
+    log("[playwright] Running Playwright with proxied script...", C.GOLD)
     try:
         process = await asyncio.create_subprocess_exec(
-            "node", node_file_path, checkout_url, sitekey, (rqdata or ""),
+            "node", node_file_path, checkout_url, sitekey, (rqdata or ""), hc_file_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
