@@ -5,11 +5,6 @@ from collections import defaultdict
 import requests
 from stripe_core import StripeSession, parse_card, log, C
 
-try:
-    from flask import Flask, jsonify
-except ImportError:
-    print("pip install flask --break-system-packages"); sys.exit(1)
-
 TG_TOKEN = ""
 TG_ADMIN = 0
 user_state = {}
