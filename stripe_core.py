@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, re, sys, json, time, uuid, hmac, base64, random, hashlib, asyncio, secrets
+import os, re, sys, json, time, uuid, hmac, base64, random, hashlib, asyncio, secrets, traceback
 import urllib.parse
 from urllib.parse import unquote, urlencode, urljoin, urlparse
 from datetime import datetime
@@ -182,71 +182,91 @@ async def _run_nodriver_hcaptcha(checkout_url, proxy_entry=None, rqdata=None, si
 
         js = f"""
         (async () => {{
+            function waitFor(condition, timeout, interval) {{
+                return new Promise((resolve, reject) => {{
+                    const start = Date.now();
+                    const check = () => {{
+                        try {{
+                            if (condition()) return resolve(true);
+                        }} catch(e) {{}}
+                        if (Date.now() - start > timeout) return reject('timeout');
+                        setTimeout(check, interval);
+                    }};
+                    check();
+                }});
+            }}
+
+            // 1. استنى Stripe يحمل الكابتشا بنفسه (عشان نتغلب على حماية CSP)
             try {{
-                if (typeof hcaptcha !== 'undefined') {{
-                    let existing = hcaptcha.getResponse();
-                    if (existing) return existing;
-                }}
-                
-                if (typeof hcaptcha === 'undefined') {{
+                await waitFor(() => typeof hcaptcha !== 'undefined' && hcaptcha.render, 10000, 500);
+            }} catch(e) {{
+                // 2. لو ملقاهوش، حاول انت تحمله
+                try {{
                     await new Promise((res, rej) => {{
                         const s = document.createElement('script');
                         s.src = 'https://js.hcaptcha.com/1/api.js?render=explicit';
                         s.onload = res;
-                        s.onerror = () => rej('script-load-fail');
+                        s.onerror = () => rej('CSP_blocked_or_network_error');
                         document.head.appendChild(s);
                     }});
+                    await waitFor(() => typeof hcaptcha !== 'undefined' && hcaptcha.render, 5000, 500);
+                }} catch(e2) {{
+                    return 'err_loading_hcaptcha: ' + (e2.message || e2.toString());
                 }}
-                
-                return await new Promise((resolve, reject) => {{
-                    const holder = document.createElement('div');
-                    holder.id = '__hc_holder';
-                    document.body.appendChild(holder);
-                    let done = false;
-                    const t = setTimeout(() => {{ if (!done) {{ done = true; reject('timeout-20s'); }} }}, 20000);
-                    
-                    try {{
-                        const wid = hcaptcha.render(holder, {{
-                            sitekey: '{sk_safe}',
-                            size: 'invisible',
-                            rqdata: '{rq_safe}',
-                            callback: (tok) => {{ if (done) return; done = true; clearTimeout(t); resolve(tok); }},
-                            'error-callback': (e) => {{ if (done) return; done = true; clearTimeout(t); reject('err:' + e); }}
-                        }});
-                        
-                        hcaptcha.execute(wid, {{rqdata: '{rq_safe}'}}).catch(e => {{
-                            if (!done) {{ done = true; clearTimeout(t); reject('exec:' + (e.message || e)); }}
-                        }});
-                    }} catch(e) {{
-                        if (!done) {{ done = true; clearTimeout(t); reject('sync-exec:' + e.message); }}
-                    }}
-                }});
-            }} catch(e) {{
-                return 'global-err: ' + e.message;
             }}
+
+            // 3. لو فيه توكن قديم موجود
+            try {{
+                let existing = hcaptcha.getResponse();
+                if (existing && existing.length > 20) return existing;
+            }} catch(e) {{}}
+
+            // 4. اعمل render ونفذ
+            return await new Promise((resolve, reject) => {{
+                const holder = document.createElement('div');
+                holder.id = '__hc_holder_' + Date.now();
+                document.body.appendChild(holder);
+                let done = false;
+                const t = setTimeout(() => {{ if (!done) {{ done = true; reject('execution_timeout_20s'); }} }}, 20000);
+                
+                try {{
+                    const wid = hcaptcha.render(holder, {{
+                        sitekey: '{sk_safe}',
+                        size: 'invisible',
+                        rqdata: '{rq_safe}',
+                        callback: (tok) => {{ if (done) return; done = true; clearTimeout(t); resolve(tok); }},
+                        'error-callback': (e) => {{ if (done) return; done = true; clearTimeout(t); reject('hcaptcha_error_callback: ' + e); }}
+                    }});
+                    
+                    hcaptcha.execute(wid, {{rqdata: '{rq_safe}'}}).catch(e => {{
+                        if (!done) {{ done = true; clearTimeout(t); reject('execute_rejection: ' + (e.message || e.toString())); }}
+                    }});
+                }} catch(e) {{
+                    if (!done) {{ done = true; clearTimeout(t); reject('render_sync_error: ' + (e.message || e.toString())); }}
+                }}
+            }});
         }})()
         """
 
         token = await page.evaluate(js, await_promise=True, return_by_value=True)
 
-        if token and isinstance(token, str) and len(token) > 20 and not token.startswith("global-err"):
+        if token and isinstance(token, str) and len(token) > 20 and not token.startswith("err_"):
             log(f"[nodriver] token OK ({len(token)} chars)", C.LIME)
             return token
-        log(f"[nodriver] token invalid: {str(token)[:80]}", C.RED)
+        log(f"[nodriver] token invalid: {str(token)}", C.RED)
         return None
     except Exception as e:
-        log(f"[nodriver] EXC: {type(e).__name__}: {str(e)[:120]}", C.RED)
+        log(f"[nodriver] EXC: {str(e)}", C.RED)
+        log(f"[nodriver] TRACEBACK: {traceback.format_exc()[:300]}", C.RED)
         return None
     finally:
         try:
             if browser: browser.stop()
         except Exception: pass
-        
         try: os.system("pkill -9 -f chromium > /dev/null 2>&1")
         except Exception: pass
         try: os.system("pkill -9 -f chrome > /dev/null 2>&1")
         except Exception: pass
-        
         if ext_dir and os.path.exists(ext_dir):
             try: shutil.rmtree(ext_dir, ignore_errors=True)
             except Exception: pass
