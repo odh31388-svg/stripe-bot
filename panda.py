@@ -58,17 +58,39 @@ def is_param_error(msg):
     return ("unknown parameter" in m or "parameter_unknown" in m
             or "received unknown" in m or "did you mean" in m)
 
-# --- الفكرة الجديدة: Playwright مع bypass_csp وحقن مباشر ---
+# --- الفكرة الجديدة: تخطي الـ DNS ---
+async def _get_hcaptcha_ip():
+    log("[dns] Asking Cloudflare for hCaptcha IP to bypass VPN block...", C.GOLD)
+    session = AsyncSession(impersonate="chrome", timeout=10)
+    try:
+        r = await session.get("https://1.1.1.1/dns-query?name=js.hcaptcha.com&type=A", headers={"accept": "application/dns-json"})
+        data = r.json()
+        if "Answer" in data and len(data["Answer"]) > 0:
+            ip = data["Answer"][0]["data"]
+            log(f"[dns] Found IP: {ip}", C.LIME)
+            return ip
+    except Exception as e:
+        log(f"[dns] Failed to resolve via DoH: {e}", C.RED)
+    finally:
+        await session.close()
+    return None
+
 async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
     if not sitekey:
         log("[playwright] missing sitekey", C.RED)
         return None
 
-    log("[playwright] Downloading hCaptcha script via curl_cffi...", C.GOLD)
+    # 1. تخطي الـ DNS
+    ip_addr = await _get_hcaptcha_ip()
+    if not ip_addr:
+        return None
+
+    # 2. جلب السكريبت من الـ IP مباشرة
+    log("[curl_cffi] Downloading script from direct IP...", C.GOLD)
     hc_script_text = ""
     session = AsyncSession(impersonate="chrome", timeout=15)
     try:
-        r = await session.get("https://js.hcaptcha.com/1/api.js?render=explicit")
+        r = await session.get(f"https://{ip_addr}/1/api.js?render=explicit", headers={"Host": "js.hcaptcha.com"})
         if r.status_code == 200:
             hc_script_text = r.text
             log(f"[curl_cffi] Script downloaded ({len(hc_script_text)} bytes)", C.LIME)
@@ -100,16 +122,11 @@ async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
                 headless: true,
                 args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
             });
-            
-            // الفكرة 1: كسر الـ CSP
             const context = await browser.newContext({ bypassCSP: true });
             const page = await context.newPage();
             
             await page.goto(url, { waitUntil: 'domcontentloaded' });
-            
-            // الفكرة 2: حقن السكريبت باستخدام addScriptTag
             await page.addScriptTag({ content: hc_script });
-            
             await page.waitForTimeout(2000);
             
             const token = await page.evaluate(async ({sitekey, rqdata}) => {
@@ -137,7 +154,7 @@ async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
     with open(node_file_path, "w") as f:
         f.write(node_script)
 
-    log("[playwright] Running Node.js Playwright solver (bypassing CSP)...", C.GOLD)
+    log("[playwright] Running Node.js Playwright solver...", C.GOLD)
     try:
         process = await asyncio.create_subprocess_exec(
             "node", node_file_path, checkout_url, sitekey, (rqdata or ""), hc_file_path,
@@ -145,19 +162,9 @@ async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
             stderr=asyncio.subprocess.PIPE
         )
         stdout, stderr = await process.communicate()
-        
         out = stdout.decode().strip()
-        err = stderr.decode().strip()
         
-        if process.returncode != 0:
-            log(f"[playwright] Node process failed: {err[:100]}", C.RED)
-            return None
-            
-        if out.startswith("NODE_EXC:"):
-            log(f"[playwright] {out}", C.RED)
-            return None
-            
-        if out and len(out) > 50 and not out.startswith("error_"):
+        if out and len(out) > 50 and not out.startswith("error_") and not out.startswith("NODE_EXC"):
             log(f"[playwright] token OK ({len(out)} chars)", C.LIME)
             return out
             
