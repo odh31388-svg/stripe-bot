@@ -121,7 +121,6 @@ async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
     const hc_script = fs.readFileSync(hc_file, 'utf8');
     const usagi_script = `""" + usagi_script + """`;
 
-    // مؤقت إجباري للخروج لو الكود علق
     const forceTimeout = setTimeout(() => {
         console.log("FINAL_TOKEN: timeout_40s");
         process.exit(1);
@@ -139,17 +138,24 @@ async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
             const page = await context.newPage();
             page.on('pageerror', err => console.log('BROWSER_ERROR: ' + err.message));
             
+            // تعديل مسار الـ Route لمنع الـ Timeout وتعطيل الاتصالات الحقيقية العالقة
             await page.route('**/*hcaptcha*', async (route) => {
-                if (route.request().url().includes('api.js')) {
+                const reqUrl = route.request().url();
+                if (reqUrl.includes('api.js')) {
                     await route.fulfill({ status: 200, contentType: 'application/javascript', body: hc_script });
+                } else if (reqUrl.includes('getsiteconfig') || reqUrl.includes('checksite')) {
+                    await route.fulfill({ 
+                        status: 200, 
+                        contentType: 'application/json', 
+                        body: JSON.stringify({"pass": true, "expanded": true}) 
+                    });
                 } else {
-                    await route.continue();
+                    await route.abort();
                 }
             });
             
             await page.goto(url, { waitUntil: 'domcontentloaded' });
             
-            // استنى بس لما hcaptcha يظهر
             try {
                 await page.waitForFunction(() => typeof hcaptcha !== 'undefined', { timeout: 5000 });
             } catch(e) {
@@ -158,7 +164,6 @@ async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
                 return;
             }
             
-            // حقن كود الـ Usagi عشان يضغط لو ظهر تحدي
             await page.evaluate(usagi_script);
 
             const token = await page.evaluate(async ({sitekey, rqdata}) => {
@@ -196,7 +201,6 @@ async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
             stderr=asyncio.subprocess.PIPE
         )
         
-        # إجبار البايثون على الاستسلام بعد 45 ثانية
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=45.0)
         out = stdout.decode().strip()
         
