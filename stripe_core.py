@@ -26,6 +26,7 @@ class C:
 def log(t, color=C.CYN):
     print(f"{color}[{datetime.now().strftime('%H:%M:%S')}] {t}{C.R}")
 
+# --- FID Decoder ---
 def decode_fid(fid_or_url: str) -> dict[str, Any]:
     if not fid_or_url: return {}
     raw = str(fid_or_url).strip()
@@ -309,7 +310,7 @@ class StripeSession:
         if not self.pk or not self.cs: return False, "missing cs/pk"
         
         if self.session: await self.session.close()
-        # إجبار المكتبة على استخدام IPv4 عشان نتخطى مشكلة الـ DNS
+        # إجبار المكتبة على استخدام IPv4 لتخطي مشكلة الـ DNS في شبكات الموبايل
         self.session = AsyncSession(impersonate="chrome", ipv4=True, timeout=30)
         
         try:
