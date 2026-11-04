@@ -63,27 +63,51 @@ async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
         log("[playwright] missing sitekey", C.RED)
         return None
 
-    log("[proxy] Fetching hCaptcha script via CORS Proxy...", C.GOLD)
+    hc_file_path = "hc_script.js"
     hc_script_text = ""
-    session = AsyncSession(impersonate="chrome", timeout=20)
-    try:
-        # استخدام وسيط AllOrigins لجلب السكريبت
-        proxy_url = "https://api.allorigins.win/raw?url=https://js.hcaptcha.com/1/api.js"
-        r = await session.get(proxy_url)
-        if r.status_code == 200:
-            hc_script_text = r.text
-            log(f"[proxy] Script fetched ({len(hc_script_text)} bytes)", C.LIME)
-    except Exception as e:
-        log(f"[proxy] Error: {e}", C.RED)
-    finally:
-        await session.close()
+
+    # 1. هل السكريبت موجود عندنا من قبل؟
+    if os.path.exists(hc_file_path):
+        with open(hc_file_path, "r") as f:
+            hc_script_text = f.read()
+        log("[cache] Loaded hCaptcha script from local cache!", C.LIME)
+    else:
+        # 2. لو مش موجود، نجيب من جوجل ترانسليت (مستحيل يتحجب)
+        log("[google] Fetching script via Google Translate Proxy...", C.GOLD)
+        session = AsyncSession(impersonate="chrome", timeout=20)
+        try:
+            # نستخدم مترجم جوجل كبروكسي عشان يتخطى الحجب
+            proxy_url = "https://js-hcaptcha-com.translate.goog/1/api.js?render=explicit&_x_tr_sl=auto&_x_tr_tl=en&_x_tr_hl=en"
+            r = await session.get(proxy_url)
+            if r.status_code == 200:
+                hc_script_text = r.text
+                with open(hc_file_path, "w") as f:
+                    f.write(hc_script_text)
+                log(f"[google] Script fetched and cached ({len(hc_script_text)} bytes)", C.LIME)
+        except Exception as e:
+            log(f"[google] Error: {e}", C.RED)
+        finally:
+            await session.close()
+
+    # 3. لو فشل، نجرب بروكسي تاني
+    if not hc_script_text:
+        log("[proxy2] Trying alternative proxy...", C.GOLD)
+        session = AsyncSession(impersonate="chrome", timeout=15)
+        try:
+            r = await session.get("https://api.codetabs.com/v1/proxy/?quest=https://js.hcaptcha.com/1/api.js")
+            if r.status_code == 200:
+                hc_script_text = r.text
+                with open(hc_file_path, "w") as f:
+                    f.write(hc_script_text)
+                log(f"[proxy2] Script fetched ({len(hc_script_text)} bytes)", C.LIME)
+        except Exception:
+            pass
+        finally:
+            await session.close()
 
     if not hc_script_text:
+        log("[error] Could not get hCaptcha script.", C.RED)
         return None
-
-    hc_file_path = "hc_script.js"
-    with open(hc_file_path, "w") as f:
-        f.write(hc_script_text)
 
     node_script = """
     const { chromium } = require('playwright');
@@ -104,7 +128,6 @@ async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
             const context = await browser.newContext({ bypassCSP: true });
             const page = await context.newPage();
             
-            // اعتراض الطلبات عشان نمرر السكريبت
             await page.route('**/*', async (route) => {
                 const reqUrl = route.request().url();
                 if (reqUrl.includes('js.hcaptcha.com')) {
@@ -142,7 +165,7 @@ async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
     with open(node_file_path, "w") as f:
         f.write(node_script)
 
-    log("[playwright] Running Playwright with proxied script...", C.GOLD)
+    log("[playwright] Running Playwright with cached script...", C.GOLD)
     try:
         process = await asyncio.create_subprocess_exec(
             "node", node_file_path, checkout_url, sitekey, (rqdata or ""), hc_file_path,
