@@ -1,7 +1,7 @@
 # ═══════════════════════════════════════════════════════════════════════════
-#  DELUXE ADYEN BYPASS ENGINE — v9 ARABIC EDITION
+#  DELUXE ADYEN BYPASS ENGINE — v9 ARABIC BIDI FIX
 #  · Fixed for curl_cffi 0.17.0 (Horus/Alpine compatible)
-#  · Arabic Interface
+#  · BiDi Reversed Arabic Interface
 # ═══════════════════════════════════════════════════════════════════════════
 
 import os
