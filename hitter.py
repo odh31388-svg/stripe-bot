@@ -35,6 +35,26 @@ IMPERSONATE_POOL = [
     "safari15_5", "safari17_0", "edge101"
 ]
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  ARABIC BIDI FIX — يحل مشكلة تقليب العربي في Termux
+# ═══════════════════════════════════════════════════════════════════════════
+def ar(text: str) -> str:
+    """
+    يعكس النص العربي عشان يطلع صح في Termux.
+    لو طلع مقلوب بالعكس، غير السطر اللي جوه:
+      return line[::-1]   ->   return line
+    """
+    if not text:
+        return text
+    try:
+        out_lines = []
+        for line in str(text).split('\n'):
+            out_lines.append(line[::-1])
+        return '\n'.join(out_lines)
+    except Exception:
+        return str(text)
+
+
 def _random_ua() -> str:
     major = random.randint(120, 131)
     build = random.randint(6000, 6999)
@@ -158,18 +178,21 @@ class C:
     CYAN = "\033[96m"; WHITE = "\033[97m"; GREY = "\033[90m"
 
 def clear(): os.system("clear")
+
 def banner():
+    title = ar("محرك اختراق Adyen - نسخة هوروس")
     print(f"""{C.MAGENTA}{C.BOLD}
     ╔══════════════════════════════════════════════════════════════════╗
-    ║             محرك اختراق Adyen - نسخة هوروس                       ║
+    ║             {title}                       ║
     ╚══════════════════════════════════════════════════════════════════╝{C.RESET}
     """)
+
 def hr(char="─", n=68, color=C.GREY): print(f"{color}{char * n}{C.RESET}")
-def prompt(txt, color=C.CYAN): return input(f"{color}{C.BOLD}[?]{C.RESET} {txt}")
-def log_ok(msg): print(f"{C.GREEN}[+]{C.RESET} {msg}")
-def log_err(msg): print(f"{C.RED}[-]{C.RESET} {msg}")
-def log_info(msg): print(f"{C.CYAN}[*]{C.RESET} {msg}")
-def log_warn(msg): print(f"{C.YELLOW}[!]{C.RESET} {msg}")
+def prompt(txt, color=C.CYAN): return input(f"{color}{C.BOLD}[?]{C.RESET} {ar(txt)}")
+def log_ok(msg): print(f"{C.GREEN}[+]{C.RESET} {ar(msg)}")
+def log_err(msg): print(f"{C.RED}[-]{C.RESET} {ar(msg)}")
+def log_info(msg): print(f"{C.CYAN}[*]{C.RESET} {ar(msg)}")
+def log_warn(msg): print(f"{C.YELLOW}[!]{C.RESET} {ar(msg)}")
 def dbg(tag, msg): print(f"{C.DIM}[{tag}]{C.RESET} {msg}")
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -909,7 +932,7 @@ def load_cards_interactive() -> List[dict]:
         c = parse_card_line(line)
         if c:
             cards.append(c); print(f"{C.GREEN}  ✓ {c['card'][:6]}…{c['card'][-4:]}|{c['month']}|{c['year']}|{c['cvv']}{C.RESET}")
-        else: print(f"{C.RED}  ✗ السطر غير صالح، تم تجاهله{C.RESET}")
+        else: print(f"{C.RED}  ✗ {ar('السطر غير صالح، تم تجاهله')}{C.RESET}")
     return cards
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -917,7 +940,7 @@ def load_cards_interactive() -> List[dict]:
 # ═══════════════════════════════════════════════════════════════════════════
 async def test_proxy(proxy_str: str) -> dict:
     parsed = parse_proxy(proxy_str)
-    if not parsed: return {"success": False, "error": "تنسيق غير صالح"}
+    if not parsed: return {"success": False, "error": ar("تنسيق غير صالح")}
     proxies = {"http": parsed["http"], "https": parsed["https"]}
     try:
         impersonate = _random_impersonate(); ua = _random_ua(); t0 = time.time()
@@ -925,7 +948,7 @@ async def test_proxy(proxy_str: str) -> dict:
             r = await _cc_get(sess, "http://ip-api.com/json/?fields=status,country,countryCode,query,timezone,isp", headers={"User-Agent": ua, "Accept": "application/json"})
             elapsed_ms = int((time.time() - t0) * 1000); status = _cc_status(r); d = _cc_json(r)
             if status != 200 or not isinstance(d, dict): return {"success": False, "error": f"status={status}"}
-            if d.get("status") != "success": return {"success": False, "error": d.get("message", "غير معروف")}
+            if d.get("status") != "success": return {"success": False, "error": d.get("message", ar("غير معروف"))}
             return {"success": True, "ip": d.get("query", ""), "country": d.get("country", ""), "country_code": d.get("countryCode", ""), "isp": d.get("isp", ""), "timezone": d.get("timezone", ""), "response_ms": elapsed_ms}
     except Exception as e:
         return {"success": False, "error": str(e)[:120]}
@@ -940,10 +963,10 @@ def print_result(idx: int, total: int, r: dict):
     if r.get("success"):
         line = (f"{C.GREEN}{C.BOLD}[HIT]{C.RESET} {C.WHITE}{idx}/{total}{C.RESET}  {C.GREEN}{cc_full}{C.RESET}  {C.GREEN}→ AUTHORISED ({dt}s){C.RESET}")
         print(line); hr("═", 68, C.GREEN)
-        print(f"{C.GREEN}{C.BOLD}  ✅  تم السحب بنجاح!  {cc_full}{C.RESET}")
-        if r.get("amount"): print(f"{C.GREEN}  المبلغ: {r['amount']}{C.RESET}")
-        if r.get("merchant"): print(f"{C.GREEN}  المتجر: {r['merchant']}{C.RESET}")
-        if r.get("receipt_url"): print(f"{C.GREEN}  الفاتورة: {r['receipt_url']}{C.RESET}")
+        print(f"{C.GREEN}{C.BOLD}  ✅  {ar('تم السحب بنجاح!')}  {cc_full}{C.RESET}")
+        if r.get("amount"): print(f"{C.GREEN}  {ar('المبلغ:')} {r['amount']}{C.RESET}")
+        if r.get("merchant"): print(f"{C.GREEN}  {ar('المتجر:')} {r['merchant']}{C.RESET}")
+        if r.get("receipt_url"): print(f"{C.GREEN}  {ar('الفاتورة:')} {r['receipt_url']}{C.RESET}")
         hr("═", 68, C.GREEN); return
     live_codes = AdyenHitter.LIVE_DECLINE
     if code in live_codes: color = C.YELLOW; tag = "LIVE"
@@ -982,19 +1005,19 @@ async def run_tool(url: str, cards: List[dict], ccn_mode: bool = False, pacing: 
     hr(); log_ok(f"انتهى — المحاولات={len(results)}  النجاح={hits}  الوقت={elapsed} ثانية")
     if hitter._sid_history:
         unique_sids = list(set(hitter._sid_history))
-        print(f"\n{C.CYAN}{C.BOLD}[ملخص الجلسة]{C.RESET}")
-        print(f"  إجمالي المحاولات: {hitter._setup_count}")
-        print(f"  الجلسات الفريدة:  {len(unique_sids)} / {len(hitter._sid_history)}")
-        if len(unique_sids) < len(hitter._sid_history): print(f"  {C.YELLOW}⚠ تم اكتشاف كاش — نفس الجلسة مستخدمة!{C.RESET}")
-        else: print(f"  {C.GREEN}✓ كل الجلسات فريدة — لا يوجد كاش{C.RESET}")
+        print(f"\n{C.CYAN}{C.BOLD}{ar('[ملخص الجلسة]')}{C.RESET}")
+        print(f"  {ar('إجمالي المحاولات:')} {hitter._setup_count}")
+        print(f"  {ar('الجلسات الفريدة:')}  {len(unique_sids)} / {len(hitter._sid_history)}")
+        if len(unique_sids) < len(hitter._sid_history): print(f"  {C.YELLOW}⚠ {ar('تم اكتشاف كاش — نفس الجلسة مستخدمة!')}{C.RESET}")
+        else: print(f"  {C.GREEN}✓ {ar('كل الجلسات فريدة — لا يوجد كاش')}{C.RESET}")
         hr()
     if link_dead: log_warn("الرابط ميت — أنشئ رابط PBL جديد (وتأكد من البروكسي) وجرب مرة ثانية")
     return results
 
 def choose_mode() -> str:
-    hr(); print(f"{C.CYAN}{C.BOLD}اختر الوضع:{C.RESET}")
-    print(f"  {C.GREEN}[1]{C.RESET} cc   — كروت كاملة (cc|mm|yy|cvv)")
-    print(f"  {C.YELLOW}[2]{C.RESET} ccn  — كروت بدون CVV (يتم توليده)"); print()
+    hr(); print(f"{C.CYAN}{C.BOLD}{ar('اختر الوضع:')}{C.RESET}")
+    print(f"  {C.GREEN}[1]{C.RESET} cc   — {ar('كروت كاملة')} (cc|mm|yy|cvv)")
+    print(f"  {C.YELLOW}[2]{C.RESET} ccn  — {ar('كروت بدون CVV (يتم توليده)')}"); print()
     while True:
         ch = prompt("الوضع [1/2] (الافتراضي 1): ", C.CYAN).strip() or "1"
         if ch in ("1", "cc"): return "cc"
@@ -1002,9 +1025,9 @@ def choose_mode() -> str:
         log_err("اختيار غير صالح")
 
 def choose_source() -> List[dict]:
-    hr(); print(f"{C.CYAN}{C.BOLD}مصدر الكروت:{C.RESET}")
-    print(f"  {C.GREEN}[1]{C.RESET} لصق يدوي")
-    print(f"  {C.YELLOW}[2]{C.RESET} تحميل من ملف (cards.txt)"); print()
+    hr(); print(f"{C.CYAN}{C.BOLD}{ar('مصدر الكروت:')}{C.RESET}")
+    print(f"  {C.GREEN}[1]{C.RESET} {ar('لصق يدوي')}")
+    print(f"  {C.YELLOW}[2]{C.RESET} {ar('تحميل من ملف (cards.txt)')}"); print()
     while True:
         ch = prompt("المصدر [1/2] (الافتراضي 1): ", C.CYAN).strip() or "1"
         if ch == "1": return load_cards_interactive()
@@ -1031,16 +1054,16 @@ def ask_yes_no(prompt_txt: str, default: bool = True) -> bool:
     return s in ("y", "yes", "e", "evet", "نعم")
 
 async def ask_proxy() -> Optional[dict]:
-    hr(); print(f"{C.CYAN}{C.BOLD}بروكسي (اختياري){C.RESET}")
-    print(f"{C.DIM}التنسيقات المدعومة:{C.RESET}")
-    print(f"  host:port")
-    print(f"  host:port:user:pass")
-    print(f"  user:pass@host:port")
-    print(f"  user:pass:host:port")
-    print(f"  http://host:port")
-    print(f"  http://user:pass@host:port")
-    print(f"  socks5://user:pass@host:port")
-    print(f"{C.DIM}اتركه فارغاً للمتابعة بدون بروكسي.{C.RESET}"); print()
+    hr(); print(f"{C.CYAN}{C.BOLD}{ar('بروكسي (اختياري)')}{C.RESET}")
+    print(f"{C.DIM}{ar('التنسيقات المدعومة:')}{C.RESET}")
+    print("  host:port")
+    print("  host:port:user:pass")
+    print("  user:pass@host:port")
+    print("  user:pass:host:port")
+    print("  http://host:port")
+    print("  http://user:pass@host:port")
+    print("  socks5://user:pass@host:port")
+    print(f"{C.DIM}{ar('اتركه فارغاً للمتابعة بدون بروكسي.')}{C.RESET}"); print()
     raw = prompt("البروكسي: ", C.CYAN).strip()
     if not raw: log_warn("المتابعة بدون بروكسي"); return None
     parsed = parse_proxy(raw)
@@ -1052,7 +1075,7 @@ async def ask_proxy() -> Optional[dict]:
         again = ask_yes_no("تجرب بروكسي ثاني؟", default=True)
         if again: return await ask_proxy()
         log_warn("المتابعة بدون بروكسي"); return None
-    print(f"{C.GREEN}[+]{C.RESET} البروكسي شغال  |  IP: {result['ip']}  الدولة: {result['country']} ({result['country_code']})  ISP: {result.get('isp', 'N/A')}  الاستجابة: {result['response_ms']}ms")
+    print(f"{C.GREEN}[+]{C.RESET} {ar('البروكسي شغال')}  |  IP: {result['ip']}  {ar('الدولة:')} {result['country']} ({result['country_code']})  ISP: {result.get('isp', 'N/A')}  {ar('الاستجابة:')} {result['response_ms']}ms")
     return {"http": parsed["http"], "https": parsed["https"], "raw": raw, "ip": result["ip"], "country": result["country"], "country_code": result["country_code"]}
 
 async def main_menu():
@@ -1067,37 +1090,37 @@ async def main_menu():
         mode = choose_mode(); ccn_mode = (mode == "ccn")
         cards = choose_source()
         if not cards:
-            log_err("لم يتم تحميل كروت — العودة للقائمة"); input(f"\n{C.GREY}اضغط ENTER للمتابعة…{C.RESET}"); continue
+            log_err("لم يتم تحميل كروت — العودة للقائمة"); input(f"\n{C.GREY}{ar('اضغط ENTER للمتابعة…')}{C.RESET}"); continue
         hr(); log_info(f"إجمالي الكروت المحملة: {len(cards)}")
         max_attempts = ask_int(f"أقصى عدد محاولات (1-{len(cards)}, الافتراضي {len(cards)}): ", default=len(cards))
         max_attempts = max(1, min(max_attempts, len(cards)))
         stop_on_hit = ask_yes_no("التوقف عند أول نجاح؟", default=True)
         pacing_on = ask_yes_no("استخدام تأخير بين المحاولات (3-4 ثواني)؟", default=True)
-        hr(); print(f"{C.CYAN}{C.BOLD}ملخص:{C.RESET}")
-        print(f"  الرابط     : {C.WHITE}{url}{C.RESET}")
-        if proxy_data: print(f"  البروكسي   : {C.GREEN}{proxy_data['ip']} ({proxy_data['country']}){C.RESET}")
-        else: print(f"  البروكسي   : {C.YELLOW}لا يوجد (قد يسبب حظر){C.RESET}")
-        print(f"  الوضع      : {C.WHITE}{mode}{C.RESET}")
-        print(f"  الكروت     : {C.WHITE}{len(cards)}{C.RESET}")
-        print(f"  المحاولات  : {C.WHITE}{max_attempts}{C.RESET}")
-        print(f"  توقف النجاح: {C.WHITE}{stop_on_hit}{C.RESET}")
-        print(f"  التأخير    : {C.WHITE}{pacing_on}{C.RESET}"); hr()
+        hr(); print(f"{C.CYAN}{C.BOLD}{ar('ملخص:')}{C.RESET}")
+        print(f"  {ar('الرابط')}     : {C.WHITE}{url}{C.RESET}")
+        if proxy_data: print(f"  {ar('البروكسي')}   : {C.GREEN}{proxy_data['ip']} ({proxy_data['country']}){C.RESET}")
+        else: print(f"  {ar('البروكسي')}   : {C.YELLOW}{ar('لا يوجد (قد يسبب حظر)')}{C.RESET}")
+        print(f"  {ar('الوضع')}      : {C.WHITE}{mode}{C.RESET}")
+        print(f"  {ar('الكروت')}     : {C.WHITE}{len(cards)}{C.RESET}")
+        print(f"  {ar('المحاولات')}  : {C.WHITE}{max_attempts}{C.RESET}")
+        print(f"  {ar('توقف النجاح')}: {C.WHITE}{stop_on_hit}{C.RESET}")
+        print(f"  {ar('التأخير')}    : {C.WHITE}{pacing_on}{C.RESET}"); hr()
         if not ask_yes_no("بدء الضرب؟", default=True):
-            log_info("تم الإلغاء"); input(f"\n{C.GREY}اضغط ENTER للمتابعة…{C.RESET}"); continue
-        hr(); print(f"{C.YELLOW}{C.BOLD}▶  جاري البدء…{C.RESET}"); hr()
+            log_info("تم الإلغاء"); input(f"\n{C.GREY}{ar('اضغط ENTER للمتابعة…')}{C.RESET}"); continue
+        hr(); print(f"{C.YELLOW}{C.BOLD}▶  {ar('جاري البدء…')}{C.RESET}"); hr()
         try:
             await run_tool(url=url, cards=cards[:max_attempts], ccn_mode=ccn_mode, pacing=pacing_on, stop_on_hit=stop_on_hit, proxy_data=proxy_data)
         except KeyboardInterrupt: log_warn("تم الإيقاف بواسطة المستخدم")
         except Exception as e: log_err(f"خطأ أثناء التشغيل: {e}")
         hr(); again = ask_yes_no("تشغيل جلسة أخرى؟", default=False)
-        if not again: print(f"\n{C.MAGENTA}{C.BOLD}  مع السلامة 👋{C.RESET}\n"); return
+        if not again: print(f"\n{C.MAGENTA}{C.BOLD}  {ar('مع السلامة 👋')}{C.RESET}\n"); return
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  ENTRY
 # ═══════════════════════════════════════════════════════════════════════════
 def _run_cli():
     try: asyncio.run(main_menu())
-    except KeyboardInterrupt: print(f"\n{C.RED}تم الإجهاض.{C.RESET}")
+    except KeyboardInterrupt: print(f"\n{C.RED}{ar('تم الإجهاض.')}{C.RESET}")
 
 if __name__ == "__main__":
     if len(sys.argv) >= 2 and sys.argv[1] not in ("-i", "--interactive"):
