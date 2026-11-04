@@ -4,7 +4,6 @@ from stripe_core import StripeSession, parse_card, log, C
 
 async def main():
     print(f"{C.CYN}{C.B}═══ Stripe Direct Checker ═══{C.R}\n")
-    
     url = input(f"{C.GOLD}▸ أدخل رابط Stripe Checkout: {C.R}").strip()
     if not url.startswith("http"):
         print(f"{C.RED}❌ رابط غير صالح.{C.R}")
@@ -15,12 +14,10 @@ async def main():
     while True:
         line = input("  > ").strip()
         if line.lower() == 'done': break
-        if line:
-            cards_input.append(line)
+        if line: cards_input.append(line)
             
     cards = [parse_card(c) for c in cards_input]
     cards = [c for c in cards if c]
-    
     if not cards:
         print(f"{C.RED}❌ مفيش بطاقات صالحة.{C.R}")
         return
@@ -50,7 +47,7 @@ async def main():
         print(f"▸ الرسالة: {res['message']}")
         print(f"▸ الوقت: {res['response_time']:.1f}s\n")
         
-        await asyncio.sleep(1) # ثانية راحة بين البطاقات
+        await asyncio.sleep(1)
 
 if __name__ == "__main__":
     try:
