@@ -93,11 +93,9 @@ class StripeSession:
                 return False, "لم يتم العثور على مفاتيح PK أو CS في الرابط."
 
             import curl_cffi.requests as cffi
-            # استخدام إعدادات تتناسب مع بيئة Horus وتجنب انقطاع الـ SSL
             self.session = cffi.AsyncSession(impersonate="chrome110", verify=False)
             ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36'
 
-            # جلب معلومات الجلسة مباشرة بدون الحاجة لـ m.stripe.com لتفادي أخطاء الـ SSL
             init_headers = {
                 'accept': 'application/json',
                 'content-type': 'application/x-www-form-urlencoded',
@@ -119,7 +117,7 @@ class StripeSession:
                 data=init_data,
                 headers=init_headers,
                 timeout=15
-            }
+            )
             d = r_init.json() or {}
             if d.get('error'):
                 return False, d['error'].get('message', 'Init error')
@@ -168,7 +166,6 @@ class StripeSession:
         ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36'
 
         try:
-            # استخدام واجهة Standard Payment Methods للتغلب على حماية Checkout Surface Unsupported
             tok_body = {
                 'type': 'card',
                 'card[number]': cc, 'card[cvc]': cvv, 'card[exp_month]': mm, 'card[exp_year]': yy,
@@ -216,7 +213,7 @@ class StripeSession:
                 'expected_payment_method_type': 'card',
                 'expected_amount': str(self.amount),
                 'return_url': "https://checkout.stripe.com/return",
-                'client_attribution_metadata[client_session_id]': self.cs,
+                'client_attribution_metadata[client_session_id]': self.cs
             }
 
             r_conf = await self.session.post(
