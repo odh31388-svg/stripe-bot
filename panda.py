@@ -58,42 +58,29 @@ def is_param_error(msg):
     return ("unknown parameter" in m or "parameter_unknown" in m
             or "received unknown" in m or "did you mean" in m)
 
-async def _get_hcaptcha_ip():
-    log("[dns] Asking Cloudflare for hCaptcha IP to bypass VPN block...", C.GOLD)
-    session = AsyncSession(impersonate="chrome", timeout=10)
-    try:
-        r = await session.get("https://1.1.1.1/dns-query?name=js.hcaptcha.com&type=A", headers={"accept": "application/dns-json"})
-        data = r.json()
-        if "Answer" in data and len(data["Answer"]) > 0:
-            ip = data["Answer"][0]["data"]
-            log(f"[dns] Found IP: {ip}", C.LIME)
-            return ip
-    except Exception as e:
-        log(f"[dns] Failed to resolve via DoH: {e}", C.RED)
-    finally:
-        await session.close()
-    return None
-
 async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
     if not sitekey:
         log("[playwright] missing sitekey", C.RED)
         return None
 
-    ip_addr = await _get_hcaptcha_ip()
-    if not ip_addr:
-        return None
-
-    log("[curl_cffi] Downloading script from direct IP (ignoring SSL)...", C.GOLD)
+    log("[proxy] Downloading hCaptcha script via Jina Reader (Bypassing block)...", C.GOLD)
     hc_script_text = ""
-    session = AsyncSession(impersonate="chrome", timeout=15)
+    session = AsyncSession(impersonate="chrome", timeout=20)
     try:
-        # التعديل هنا: إضافة verify=False
-        r = await session.get(f"https://{ip_addr}/1/api.js?render=explicit", headers={"Host": "js.hcaptcha.com"}, verify=False)
+        # استخدام موقع وسيط بيجيب الكود من السيرفر بتاعه
+        proxy_url = "https://r.jina.ai/https://js.hcaptcha.com/1/api.js?render=explicit"
+        r = await session.get(proxy_url)
         if r.status_code == 200:
             hc_script_text = r.text
-            log(f"[curl_cffi] Script downloaded ({len(hc_script_text)} bytes)", C.LIME)
+            # تنظيف النص لو الموقع ضاف كلام من عنده
+            if "Markdown Content:" in hc_script_text:
+                hc_script_text = hc_script_text.split("Markdown Content:")[1].strip()
+            elif hc_script_text.startswith("Title:"):
+                hc_script_text = hc_script_text.split("\n\n", 1)[-1].strip()
+            
+            log(f"[proxy] Script downloaded ({len(hc_script_text)} bytes)", C.LIME)
     except Exception as e:
-        log(f"[curl_cffi] Error: {e}", C.RED)
+        log(f"[proxy] Error: {e}", C.RED)
     finally:
         await session.close()
 
