@@ -230,7 +230,9 @@ class StripeSession:
         if not self.pk or not self.cs: return False, "missing cs/pk"
         
         if self.session: await self.session.close()
-        self.session = AsyncSession(impersonate="chrome", ipv4=True, timeout=30)
+        
+        # تم تعديل السطر ده وإزالة ipv4
+        self.session = AsyncSession(impersonate="chrome", timeout=30)
         
         try:
             await self.session.get(f"https://checkout.stripe.com/c/pay/{self.cs}", headers={**self._hdrs(), "accept": "text/html,*/*"})
