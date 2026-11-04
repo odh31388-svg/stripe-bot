@@ -119,7 +119,7 @@ def _create_proxy_auth_extension(host, port, user, pw):
         zp.writestr("background.js", background_js)
     return ext_path
 
-def _run_selenium_hcaptcha(checkout_url, proxy_entry=None):
+def _run_selenium_hcaptcha(checkout_url, proxy_entry=None, rqdata=None, sitekey=None):
     opts = Options()
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
@@ -128,6 +128,9 @@ def _run_selenium_hcaptcha(checkout_url, proxy_entry=None):
     opts.add_argument("--disable-software-rasterizer")
     opts.add_argument("--no-zygote")
     opts.add_argument("--window-size=1920,1080")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option('useAutomationExtension', False)
     opts.binary_location = "/usr/bin/chromium-browser"
 
     ext_path = None
@@ -146,18 +149,55 @@ def _run_selenium_hcaptcha(checkout_url, proxy_entry=None):
     driver = None
     try:
         driver = webdriver.Chrome(service=service, options=opts)
-        driver.get(checkout_url)
-        time.sleep(12) # زدنا الوقت عشان الكابتشا تاخذ راحتها
-        log(f"[Selenium] Page Title: {driver.title}", C.YEL)
+        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         
-        token = driver.execute_script("""
-            return document.querySelector('[name="h-captcha-response"]')?.value || 
-                   document.querySelector('textarea[name="h-captcha-response"]')?.value || 
-                   document.querySelector('input[name="h-captcha-response"]')?.value || 
-                   null;
-        """)
+        driver.get(checkout_url)
+        
+        token = None
+        for _ in range(20):
+            time.sleep(1)
+            token = driver.execute_script("""
+                if (typeof hcaptcha !== 'undefined') {
+                    try { return hcaptcha.getResponse(); } catch(e) {}
+                }
+                return document.querySelector('[name="h-captcha-response"]')?.value || 
+                       document.querySelector('textarea[name="h-captcha-response"]')?.value || 
+                       document.querySelector('input[name="h-captcha-response"]')?.value || 
+                       null;
+            """)
+            if token:
+                break
+                
         if not token:
-            log(f"[Selenium] Token not found. Body snippet: {driver.page_source[:150]}", C.RED)
+            if rqdata and sitekey:
+                log(f"[Selenium] Executing hcaptcha manually...", C.YEL)
+                driver.execute_script(f"""
+                    if (typeof hcaptcha !== 'undefined') {{
+                        hcaptcha.execute('{sitekey}', {{rqdata: '{rqdata}'}});
+                    }} else {{
+                        const script = document.createElement('script');
+                        script.src = 'https://js.hcaptcha.com/1/api.js?render=explicit';
+                        script.onload = () => {{
+                            hcaptcha.render(document.createElement('div'), {{
+                                sitekey: '{sitekey}',
+                                size: 'invisible',
+                                callback: function(t) {{ window.__hcaptcha_token = t; }}
+                            }});
+                            hcaptcha.execute(undefined, {{rqdata: '{rqdata}'}});
+                        }};
+                        document.head.appendChild(script);
+                    }}
+                """)
+                for _ in range(15):
+                    time.sleep(1)
+                    token = driver.execute_script("return window.__hcaptcha_token || document.querySelector('textarea[name=\"h-captcha-response\"]')?.value;")
+                    if token:
+                        break
+                        
+        if token:
+            log(f"[Selenium] Token successfully retrieved!", C.LIME)
+        else:
+            log(f"[Selenium] Token NOT found after all attempts.", C.RED)
         return token
     except Exception as e:
         log(f"[Selenium] EXCEPTION: {e}", C.RED)
@@ -168,8 +208,8 @@ def _run_selenium_hcaptcha(checkout_url, proxy_entry=None):
             try: os.remove(ext_path)
             except: pass
 
-async def solve_hcaptcha_selenium(checkout_url, proxy_entry=None):
-    return await asyncio.to_thread(_run_selenium_hcaptcha, checkout_url, proxy_entry)
+async def solve_hcaptcha_selenium(checkout_url, proxy_entry=None, rqdata=None, sitekey=None):
+    return await asyncio.to_thread(_run_selenium_hcaptcha, checkout_url, proxy_entry, rqdata, sitekey)
 
 async def solve_hcaptcha(sk, pg, rq, max_attempts=2):
     return None
@@ -436,6 +476,7 @@ class StripeSession:
         pi_id = pi.get("id")
         cs_secret = pi.get("client_secret")
         rqdata = sjs.get("rqdata") or conf.get("rqdata")
+        site_key = sjs.get("site_key") or sjs.get("captcha_site_key") or HCK
         source = find_source_recursive(conf) or find_source_recursive(pi) or find_source_recursive(use_sdk)
         log(f"WAF -> source={bool(source)} rq={bool(rqdata)}", C.GOLD)
         
@@ -458,7 +499,7 @@ class StripeSession:
         if self.cs:
             log("S4: Selenium Local Browser", C.GOLD)
             checkout_url = f"https://checkout.stripe.com/c/pay/{self.cs}"
-            token = await solve_hcaptcha_selenium(checkout_url, self._proxy)
+            token = await solve_hcaptcha_selenium(checkout_url, self._proxy, rqdata, site_key)
             if token:
                 log("  Got hCaptcha token! Verifying...", C.LIME)
                 r = await self._verify_challenge(pi_id, cs_secret, token)
