@@ -8,6 +8,7 @@ import zipfile, tempfile, shutil
 try:
     from curl_cffi.requests import AsyncSession
     import nodriver as uc
+    from nodriver import cdp
 except ImportError:
     print("pip install curl-cffi nodriver websockets>=14 --break-system-packages"); sys.exit(1)
 
@@ -162,10 +163,7 @@ async def _run_nodriver_hcaptcha(checkout_url, proxy_entry=None, rqdata=None, si
     if proxy_entry:
         parsed = urlparse(proxy_entry["url"])
         if proxy_entry.get("auth"):
-            ext_dir = _create_proxy_auth_folder(
-                parsed.hostname, parsed.port,
-                proxy_entry["auth"][0], proxy_entry["auth"][1]
-            )
+            ext_dir = _create_proxy_auth_folder(parsed.hostname, parsed.port, proxy_entry["auth"][0], proxy_entry["auth"][1])
             browser_args.append(f"--load-extension={ext_dir}")
             browser_args.append(f"--disable-extensions-except={ext_dir}")
         else:
@@ -174,7 +172,15 @@ async def _run_nodriver_hcaptcha(checkout_url, proxy_entry=None, rqdata=None, si
     browser = None
     try:
         browser = await _start_browser_with_retry(proxy_entry, browser_args)
+        
+        # تفعيل تجاوز حماية CSP
         page = await browser.get(checkout_url)
+        try:
+            await page.send(cdp.page.set_bypass_csp(enabled=True))
+            log("[nodriver] CSP bypass enabled!", C.LIME)
+        except Exception as e:
+            log(f"[nodriver] CSP bypass failed: {e}", C.YEL)
+
         await page.sleep(2)
 
         rq_safe = (rqdata or "").replace("\\", "\\\\").replace("'", "\\'")
@@ -186,9 +192,7 @@ async def _run_nodriver_hcaptcha(checkout_url, proxy_entry=None, rqdata=None, si
                 return new Promise((resolve, reject) => {{
                     const start = Date.now();
                     const check = () => {{
-                        try {{
-                            if (condition()) return resolve(true);
-                        }} catch(e) {{}}
+                        try {{ if (condition()) return resolve(true); }} catch(e) {{}}
                         if (Date.now() - start > timeout) return reject('timeout');
                         setTimeout(check, interval);
                     }};
@@ -196,38 +200,34 @@ async def _run_nodriver_hcaptcha(checkout_url, proxy_entry=None, rqdata=None, si
                 }});
             }}
 
-            // 1. استنى Stripe يحمل الكابتشا بنفسه (عشان نتغلب على حماية CSP)
             try {{
-                await waitFor(() => typeof hcaptcha !== 'undefined' && hcaptcha.render, 10000, 500);
+                await waitFor(() => typeof hcaptcha !== 'undefined' && hcaptcha.render, 5000, 500);
             }} catch(e) {{
-                // 2. لو ملقاهوش، حاول انت تحمله
                 try {{
                     await new Promise((res, rej) => {{
                         const s = document.createElement('script');
                         s.src = 'https://js.hcaptcha.com/1/api.js?render=explicit';
                         s.onload = res;
-                        s.onerror = () => rej('CSP_blocked_or_network_error');
+                        s.onerror = () => rej('script_failed_to_load_status_' + (window.__hc_err || 'unknown'));
                         document.head.appendChild(s);
                     }});
-                    await waitFor(() => typeof hcaptcha !== 'undefined' && hcaptcha.render, 5000, 500);
+                    await waitFor(() => typeof hcaptcha !== 'undefined' && hcaptcha.render, 10000, 500);
                 }} catch(e2) {{
                     return 'err_loading_hcaptcha: ' + (e2.message || e2.toString());
                 }}
             }}
 
-            // 3. لو فيه توكن قديم موجود
             try {{
                 let existing = hcaptcha.getResponse();
                 if (existing && existing.length > 20) return existing;
             }} catch(e) {{}}
 
-            // 4. اعمل render ونفذ
             return await new Promise((resolve, reject) => {{
                 const holder = document.createElement('div');
                 holder.id = '__hc_holder_' + Date.now();
                 document.body.appendChild(holder);
                 let done = false;
-                const t = setTimeout(() => {{ if (!done) {{ done = true; reject('execution_timeout_20s'); }} }}, 20000);
+                const t = setTimeout(() => {{ if (!done) {{ done = true; reject('execution_timeout_25s'); }} }}, 25000);
                 
                 try {{
                     const wid = hcaptcha.render(holder, {{
@@ -253,11 +253,36 @@ async def _run_nodriver_hcaptcha(checkout_url, proxy_entry=None, rqdata=None, si
         if token and isinstance(token, str) and len(token) > 20 and not token.startswith("err_"):
             log(f"[nodriver] token OK ({len(token)} chars)", C.LIME)
             return token
+        
+        # لو فشل تحميل السكريبت، هنجرب نعمله inject بطريقة تانية
+        if token and "script_failed_to_load" in str(token):
+            log(f"[nodriver] Script load failed. Trying alternative injection...", C.YEL)
+            await page.evaluate("""
+                const script = document.createElement('script');
+                script.src = 'https://js.hcaptcha.com/1/api.js?render=explicit';
+                document.head.appendChild(script);
+            """)
+            await page.sleep(3)
+            token = await page.evaluate(f"""
+                (async () => {{
+                    if (typeof hcaptcha === 'undefined') return 'still_undefined';
+                    return await new Promise((resolve) => {{
+                        const wid = hcaptcha.render(document.createElement('div'), {{
+                            sitekey: '{sk_safe}', size: 'invisible', rqdata: '{rq_safe}',
+                            callback: (tok) => resolve(tok)
+                        }});
+                        hcaptcha.execute(wid);
+                    }});
+                }})()
+            """, await_promise=True, return_by_value=True)
+            if token and len(str(token)) > 20 and token != 'still_undefined':
+                log(f"[nodriver] token OK via alternative ({len(token)} chars)", C.LIME)
+                return token
+
         log(f"[nodriver] token invalid: {str(token)}", C.RED)
         return None
     except Exception as e:
         log(f"[nodriver] EXC: {str(e)}", C.RED)
-        log(f"[nodriver] TRACEBACK: {traceback.format_exc()[:300]}", C.RED)
         return None
     finally:
         try:
