@@ -4,6 +4,7 @@ import urllib.parse
 from urllib.parse import unquote, urlencode, urljoin, urlparse
 from datetime import datetime
 import tempfile, shutil
+from typing import Any
 
 try:
     from curl_cffi.requests import AsyncSession
@@ -25,29 +26,50 @@ class C:
 def log(t, color=C.CYN):
     print(f"{color}[{datetime.now().strftime('%H:%M:%S')}] {t}{C.R}")
 
-def decode_fid(u):
-    if not u: return {}
-    raw = str(u).strip(); cs = None
-    m = re.search(r"(cs_(?:live|test)_[A-Za-z0-9]+)", raw)
-    if m: cs = m.group(1)
-    if "#" in raw: raw = raw.split("#", 1)[1]
+# --- بداية الكود اللي إنت بعته (Modified FID Decoder) ---
+def decode_fid(fid_or_url: str) -> dict[str, Any]:
+    if not fid_or_url:
+        return {}
+    raw = str(fid_or_url).strip()
+    session_id = None
+    m_session = re.search(r"\b(cs_(?:live|test)_[a-zA-Z0-9]+)\b", raw)
+    if m_session:
+        session_id = m_session.group(1)
+    if "#" in raw:
+        raw = raw.split("#", 1)[1]
     raw = raw.split("?", 1)[0]
     if "_secret_" in raw:
-        l, r = raw.split("_secret_", 1)
-        if not cs and l.startswith("cs_"): cs = l
-        raw = r
-    u = unquote(raw).strip().rstrip("%")
-    if not u: return {}
-    pad = u + "=" * (-len(u) % 4)
-    try: d = base64.b64decode(pad, altchars=b"-_")
-    except:
-        try: d = base64.b64decode(pad)
-        except: return {}
-    x = bytes(b ^ 5 for b in d).decode("utf-8", errors="replace").strip()
-    try: data = json.loads(x)
-    except: return {}
-    if cs and isinstance(data, dict): data.setdefault("checkoutSessionId", cs)
-    return data if isinstance(data, dict) else {}
+        parts = raw.split("_secret_", 1)
+        if not session_id and parts[0].startswith("cs_"):
+            session_id = parts[0]
+        raw = parts[1]
+    unquoted = urllib.parse.unquote(raw)
+    b64_str = unquoted.strip().rstrip("%")
+    if not b64_str:
+        return {}
+    pad = b64_str + "=" * (-len(b64_str) % 4)
+    try:
+        decoded_bytes = base64.b64decode(pad, altchars=b"-_")
+    except Exception:
+        try:
+            decoded_bytes = base64.b64decode(pad)
+        except Exception:
+            return {}
+    xored_bytes = bytes(b ^ 5 for b in decoded_bytes)
+    xored_text = xored_bytes.decode("utf-8", errors="replace").strip()
+    try:
+        data = json.loads(xored_text)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {"value": data}
+    if session_id:
+        if "checkoutSessionId" not in data and "sessionId" not in data:
+            data["checkoutSessionId"] = session_id
+        if "client_secret" not in data:
+            data["client_secret"] = f"{session_id}_secret_{b64_str}"
+    return data
+# --- نهاية الكود اللي إنت بعته ---
 
 def extract_cs_pk(url):
     cs = pk = acct = None
@@ -120,6 +142,9 @@ async def _run_nodriver_hcaptcha(checkout_url, rqdata=None, sitekey=None):
         "--lang=en-US", "--remote-debugging-port=9222", "--disable-extensions",
         "--disable-background-networking", "--disable-default-apps", "--disable-sync",
         "--metrics-recording-only", "--mute-audio", "--no-first-run",
+        # إجبار المتصفح على استخدام DNS جوجل وكلاودفلير عشان نتخطى حجب الشبكة
+        "--dns-prefetch-disable",
+        "--host-resolver-rules=MAP * 8.8.8.8, MAP * 1.1.1.1"
     ]
 
     browser = None
@@ -158,27 +183,15 @@ async def _run_nodriver_hcaptcha(checkout_url, rqdata=None, sitekey=None):
             hc_loaded = await page.evaluate("typeof hcaptcha !== 'undefined' && hcaptcha.render")
 
         if not hc_loaded:
-            log("[nodriver] Browser failed to load script! Trying curl_cffi injection...", C.GOLD)
-            session = AsyncSession(impersonate="chrome") # Fixed: removed self._proxy_kwargs()
-            try:
-                r = await session.get("https://js.hcaptcha.com/1/api.js?render=explicit")
-                if r.status_code == 200:
-                    await page.evaluate(r.text)
-                    log("[nodriver] Script injected via curl_cffi successfully!", C.LIME)
-                else:
-                    log(f"[nodriver] curl_cffi script fetch failed: {r.status_code}", C.RED)
-            except Exception as e:
-                log(f"[nodriver] curl_cffi exception: {e}", C.RED)
-            finally:
-                await session.close()
-            await page.sleep(1)
+            log("[nodriver] Browser failed to load script!", C.RED)
+            return None
 
         js = f"""
         (async () => {{
             if (typeof hcaptcha === 'undefined') return 'still_undefined_after_all_tries';
             try {{
                 let existing = hcaptcha.getResponse();
-                if (existing && existing.length > 20) return existing;
+                if (existing && existing.length > 50) return existing;
             }} catch(e) {{}}
             return await new Promise((resolve, reject) => {{
                 const holder = document.createElement('div');
@@ -203,7 +216,7 @@ async def _run_nodriver_hcaptcha(checkout_url, rqdata=None, sitekey=None):
         """
 
         token = await page.evaluate(js, await_promise=True, return_by_value=True)
-        if token and isinstance(token, str) and len(token) > 20 and not token.startswith("err_"):
+        if token and isinstance(token, str) and len(token) > 50 and not token.startswith("err_") and not token.startswith("still_"):
             log(f"[nodriver] token OK ({len(token)} chars)", C.LIME)
             return token
         log(f"[nodriver] token invalid: {str(token)}", C.RED)
