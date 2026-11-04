@@ -92,44 +92,56 @@ async def _run_nodriver_hcaptcha(checkout_url, rqdata=None, sitekey=None):
     try:
         browser = await _start_browser_with_retry(browser_args)
         page = await browser.get(checkout_url)
+        await page.sleep(2)
         
-        await page.send(cdp.network.enable())
-        async def on_req_failed(e: cdp.network.LoadingFailed):
-            log(f"[NET_FAIL] {e.error_text} - Blocked by network", C.RED)
-        async def on_resp_recv(e: cdp.network.ResponseReceived):
-            if e.response.status >= 400:
-                log(f"[NET_{e.response.status}] {e.response.url}", C.RED)
-        page.add_handler(cdp.network.LoadingFailed, on_req_failed)
-        page.add_handler(cdp.network.ResponseReceived, on_resp_recv)
-
         try:
             await page.send(cdp.page.set_bypass_csp(enabled=True))
-            log("[nodriver] CSP bypass enabled!", C.LIME)
-        except Exception as e: log(f"[nodriver] CSP bypass failed: {e}", C.YEL)
+        except: pass
 
-        await page.sleep(2)
+        log("[nodriver] Fetching hCaptcha script via curl-cffi to bypass network block...", C.GOLD)
+        # الخطة الجديدة: تنزيل السكريبت بـ curl_cffi وحقنه كـ Inline
+        hc_script_text = ""
+        session = AsyncSession(impersonate="chrome")
+        try:
+            r = await session.get("https://js.hcaptcha.com/1/api.js?render=explicit")
+            if r.status_code == 200:
+                hc_script_text = r.text
+                log(f"[curl_cffi] hCaptcha script downloaded ({len(hc_script_text)} bytes)", C.LIME)
+            else:
+                log(f"[curl_cffi] failed to download hCaptcha script. HTTP {r.status_code}", C.RED)
+        except Exception as e:
+            log(f"[curl_cffi] Error fetching script: {e}", C.RED)
+        finally:
+            await session.close()
+
+        if not hc_script_text:
+            log("[nodriver] Cannot proceed without hCaptcha script", C.RED)
+            return None
+
+        # حقن الكود مباشرة في الصفحة
+        js_inject = f"""
+        (function() {{
+            var script = document.createElement('script');
+            script.type = 'text/javascript';
+            script.text = {json.dumps(hc_script_text)};
+            document.head.appendChild(script);
+        }})();
+        """
+        await page.evaluate(js_inject)
+        await page.sleep(1) # استنى ثانية عشان السكريبت يشتغل
+
+        hc_loaded = await page.evaluate("typeof hcaptcha !== 'undefined' && hcaptcha.render")
+        if not hc_loaded:
+            log("[nodriver] Inline injection failed. hcaptcha still undefined.", C.RED)
+            return None
+        
+        log("[nodriver] hCaptcha injected and loaded successfully!", C.LIME)
+
         rq_safe = (rqdata or "").replace("\\", "\\\\").replace("'", "\\'")
         sk_safe = sitekey.replace("'", "\\'")
 
-        hc_loaded = await page.evaluate("typeof hcaptcha !== 'undefined' && hcaptcha.render")
-        
-        if not hc_loaded:
-            log("[nodriver] hCaptcha missing, injecting via browser...", C.YEL)
-            await page.evaluate("""
-                const s = document.createElement('script');
-                s.src = 'https://js.hcaptcha.com/1/api.js?render=explicit';
-                document.head.appendChild(s);
-            """)
-            await page.sleep(3)
-            hc_loaded = await page.evaluate("typeof hcaptcha !== 'undefined' && hcaptcha.render")
-
-        if not hc_loaded:
-            log("[nodriver] Browser failed to load script!", C.RED)
-            return None
-
         js = f"""
         (async () => {{
-            if (typeof hcaptcha === 'undefined') return 'still_undefined_after_all_tries';
             try {{
                 let existing = hcaptcha.getResponse();
                 if (existing && existing.length > 50) return existing;
@@ -230,8 +242,6 @@ class StripeSession:
         if not self.pk or not self.cs: return False, "missing cs/pk"
         
         if self.session: await self.session.close()
-        
-        # تم تعديل السطر ده وإزالة ipv4
         self.session = AsyncSession(impersonate="chrome", timeout=30)
         
         try:
