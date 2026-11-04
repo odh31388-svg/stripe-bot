@@ -58,6 +58,7 @@ def is_param_error(msg):
     return ("unknown parameter" in m or "parameter_unknown" in m
             or "received unknown" in m or "did you mean" in m)
 
+# --- الفكرة الجديدة: Playwright مع bypass_csp وحقن مباشر ---
 async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
     if not sitekey:
         log("[playwright] missing sitekey", C.RED)
@@ -99,13 +100,17 @@ async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
                 headless: true,
                 args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
             });
-            const page = await browser.newPage();
             
-            // الفكرة الجديدة: حقن السكريبت قبل تحميل الصفحة
-            await page.addInitScript(hc_script);
+            // الفكرة 1: كسر الـ CSP
+            const context = await browser.newContext({ bypassCSP: true });
+            const page = await context.newPage();
             
             await page.goto(url, { waitUntil: 'domcontentloaded' });
-            await page.waitForTimeout(3000);
+            
+            // الفكرة 2: حقن السكريبت باستخدام addScriptTag
+            await page.addScriptTag({ content: hc_script });
+            
+            await page.waitForTimeout(2000);
             
             const token = await page.evaluate(async ({sitekey, rqdata}) => {
                 if (typeof hcaptcha === 'undefined') return 'undefined_hcaptcha';
@@ -132,7 +137,7 @@ async def _run_playwright_hcaptcha(checkout_url, rqdata=None, sitekey=None):
     with open(node_file_path, "w") as f:
         f.write(node_script)
 
-    log("[playwright] Running Node.js Playwright solver...", C.GOLD)
+    log("[playwright] Running Node.js Playwright solver (bypassing CSP)...", C.GOLD)
     try:
         process = await asyncio.create_subprocess_exec(
             "node", node_file_path, checkout_url, sitekey, (rqdata or ""), hc_file_path,
