@@ -3,7 +3,7 @@ import os, re, sys, json, time, uuid, hmac, base64, random, hashlib, asyncio, se
 import urllib.parse
 from urllib.parse import unquote, urlencode, urljoin, urlparse
 from datetime import datetime
-import zipfile, tempfile, shutil
+import tempfile, shutil
 
 try:
     from curl_cffi.requests import AsyncSession
@@ -95,23 +95,7 @@ def is_param_error(msg):
     return ("unknown parameter" in m or "parameter_unknown" in m
             or "received unknown" in m or "did you mean" in m)
 
-def _create_proxy_auth_folder(host, port, user, pw):
-    ext_dir = os.path.join(tempfile.gettempdir(), f"pxauth_{host}_{port}")
-    os.makedirs(ext_dir, exist_ok=True)
-    manifest_json = ('{"version": "1.0.0", "manifest_version": 2, "name": "Chrome Proxy", '
-        '"permissions": ["proxy","tabs","unlimitedStorage","storage","<all_urls>","webRequest","webRequestBlocking"], '
-        '"background": {"scripts": ["background.js"]}, "minimum_chrome_version":"22.0.0"}')
-    background_js = '''
-    var config = { mode: "fixed_servers", rules: { singleProxy: { scheme: "http", host: "%s", port: parseInt(%s) }, bypassList: ["localhost"] } };
-    chrome.proxy.settings.set({value: config, scope: "regular"}, function() {});
-    function callbackFn(details) { return { authCredentials: { username: "%s", password: "%s" } }; }
-    chrome.webRequest.onAuthRequired.addListener(callbackFn, {urls: ["<all_urls>"]}, ['blocking']);
-    ''' % (host, port, user, pw)
-    with open(os.path.join(ext_dir, "manifest.json"), "w") as f: f.write(manifest_json)
-    with open(os.path.join(ext_dir, "background.js"), "w") as f: f.write(background_js)
-    return ext_dir
-
-async def _start_browser_with_retry(proxy_entry, browser_args):
+async def _start_browser_with_retry(browser_args):
     last_err = None
     for attempt in range(1, 4):
         try:
@@ -125,7 +109,7 @@ async def _start_browser_with_retry(proxy_entry, browser_args):
             await asyncio.sleep(3)
     raise last_err
 
-async def _run_nodriver_hcaptcha(checkout_url, proxy_entry=None, rqdata=None, sitekey=None):
+async def _run_nodriver_hcaptcha(checkout_url, rqdata=None, sitekey=None):
     if not sitekey:
         log("[nodriver] missing sitekey", C.RED)
         return None
@@ -138,31 +122,20 @@ async def _run_nodriver_hcaptcha(checkout_url, proxy_entry=None, rqdata=None, si
         "--metrics-recording-only", "--mute-audio", "--no-first-run",
     ]
 
-    ext_dir = None
-    if proxy_entry:
-        parsed = urlparse(proxy_entry["url"])
-        if proxy_entry.get("auth"):
-            ext_dir = _create_proxy_auth_folder(parsed.hostname, parsed.port, proxy_entry["auth"][0], proxy_entry["auth"][1])
-            browser_args.extend([f"--load-extension={ext_dir}", f"--disable-extensions-except={ext_dir}"])
-        else:
-            browser_args.append(f"--proxy-server={proxy_entry['url']}")
-
     browser = None
     try:
-        browser = await _start_browser_with_retry(proxy_entry, browser_args)
+        browser = await _start_browser_with_retry(browser_args)
         page = await browser.get(checkout_url)
         
-        # تفعيل مراقبة الشبكة
         await page.send(cdp.network.enable())
         async def on_req_failed(e: cdp.network.LoadingFailed):
-            log(f"[NET_FAIL] {e.error_text} - Blocked by proxy/network", C.RED)
+            log(f"[NET_FAIL] {e.error_text} - Blocked by network", C.RED)
         async def on_resp_recv(e: cdp.network.ResponseReceived):
             if e.response.status >= 400:
                 log(f"[NET_{e.response.status}] {e.response.url}", C.RED)
         page.add_handler(cdp.network.LoadingFailed, on_req_failed)
         page.add_handler(cdp.network.ResponseReceived, on_resp_recv)
 
-        # كسر حماية CSP
         try:
             await page.send(cdp.page.set_bypass_csp(enabled=True))
             log("[nodriver] CSP bypass enabled!", C.LIME)
@@ -172,7 +145,6 @@ async def _run_nodriver_hcaptcha(checkout_url, proxy_entry=None, rqdata=None, si
         rq_safe = (rqdata or "").replace("\\", "\\\\").replace("'", "\\'")
         sk_safe = sitekey.replace("'", "\\'")
 
-        # فحص إذا كان hCaptcha موجود مسبقاً
         hc_loaded = await page.evaluate("typeof hcaptcha !== 'undefined' && hcaptcha.render")
         
         if not hc_loaded:
@@ -185,10 +157,9 @@ async def _run_nodriver_hcaptcha(checkout_url, proxy_entry=None, rqdata=None, si
             await page.sleep(3)
             hc_loaded = await page.evaluate("typeof hcaptcha !== 'undefined' && hcaptcha.render")
 
-        # الخطة البديلة: تحميل السكريبت بـ curl_cffi لو المتصفح فشل
         if not hc_loaded:
             log("[nodriver] Browser failed to load script! Trying curl_cffi injection...", C.GOLD)
-            session = AsyncSession(impersonate="chrome", **self._proxy_kwargs())
+            session = AsyncSession(impersonate="chrome") # Fixed: removed self._proxy_kwargs()
             try:
                 r = await session.get("https://js.hcaptcha.com/1/api.js?render=explicit")
                 if r.status_code == 200:
@@ -248,20 +219,9 @@ async def _run_nodriver_hcaptcha(checkout_url, proxy_entry=None, rqdata=None, si
         except Exception: pass
         try: os.system("pkill -9 -f chrome > /dev/null 2>&1")
         except Exception: pass
-        if ext_dir and os.path.exists(ext_dir):
-            try: shutil.rmtree(ext_dir, ignore_errors=True)
-            except Exception: pass
 
-    def _proxy_kwargs(self):
-        if not self._proxy: return {}
-        kw = {}; url = self._proxy["url"]; auth = self._proxy.get("auth")
-        if auth and isinstance(auth, (tuple, list)) and len(auth) == 2:
-            url = url.replace("http://", f"http://{auth[0]}:{auth[1]}@")
-        kw["proxy"] = url
-        return kw
-
-async def solve_hcaptcha_selenium(checkout_url, proxy_entry=None, rqdata=None, sitekey=None):
-    return await _run_nodriver_hcaptcha(checkout_url, proxy_entry, rqdata, sitekey)
+async def solve_hcaptcha_selenium(checkout_url, rqdata=None, sitekey=None):
+    return await _run_nodriver_hcaptcha(checkout_url, rqdata, sitekey)
 
 async def solve_hcaptcha(sk, pg, rq, max_attempts=2): return None
 
@@ -287,23 +247,14 @@ def find_source_recursive(obj, depth=0, max_depth=12):
     return None
 
 class StripeSession:
-    def __init__(self, url, proxy_entry=None):
+    def __init__(self, url):
         self.url = url.strip()
-        self._proxy = proxy_entry
         self.pk = ""; self.cs = ""; self.acct = None
         self.merchant = "Stripe"; self.amount_str = "N/A"; self.raw_amount = 0
         self.session = None; self.email = ""
         self.init_json = {}; self.hcaptcha_sitekey = HCK
         self.tracking = {"muid": str(uuid.uuid4()), "sid": str(uuid.uuid4()), "guid": str(uuid.uuid4())}
         self._current_card = None; self._current_pm_id = None
-
-    def _proxy_kwargs(self):
-        if not self._proxy: return {}
-        kw = {}; url = self._proxy["url"]; auth = self._proxy.get("auth")
-        if auth and isinstance(auth, (tuple, list)) and len(auth) == 2:
-            url = url.replace("http://", f"http://{auth[0]}:{auth[1]}@")
-        kw["proxy"] = url
-        return kw
 
     def _hdrs(self, ref=None):
         h = {
@@ -330,7 +281,7 @@ class StripeSession:
         if not self.pk or not self.cs: return False, "missing cs/pk"
         
         if self.session: await self.session.close()
-        self.session = AsyncSession(impersonate="chrome", **self._proxy_kwargs())
+        self.session = AsyncSession(impersonate="chrome")
         
         try:
             await self.session.get(f"https://checkout.stripe.com/c/pay/{self.cs}", headers={**self._hdrs(), "accept": "text/html,*/*"})
@@ -496,7 +447,7 @@ class StripeSession:
         if self.cs:
             log("S4: Nodriver Local Browser", C.GOLD)
             checkout_url = f"https://checkout.stripe.com/c/pay/{self.cs}"
-            token = await solve_hcaptcha_selenium(checkout_url, self._proxy, rqdata, site_key)
+            token = await solve_hcaptcha_selenium(checkout_url, rqdata, site_key)
             if token:
                 log("  Got hCaptcha token! Verifying...", C.LIME)
                 r = await self._verify_challenge(pi_id, cs_secret, token)
