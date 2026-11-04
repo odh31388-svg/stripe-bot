@@ -159,6 +159,13 @@ async def _run_nodriver_hcaptcha(checkout_url, proxy_entry=None, rqdata=None, si
         "--window-size=1920,1080",
         "--lang=en-US",
         "--remote-debugging-port=9222",
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--disable-default-apps",
+        "--disable-sync",
+        "--metrics-recording-only",
+        "--mute-audio",
+        "--no-first-run",
     ]
 
     ext_dir = None
@@ -178,7 +185,7 @@ async def _run_nodriver_hcaptcha(checkout_url, proxy_entry=None, rqdata=None, si
     try:
         browser = await _start_browser_with_retry(proxy_entry, browser_args)
         page = await browser.get(checkout_url)
-        await page.sleep(3)
+        await page.sleep(1)
 
         rq_safe = (rqdata or "").replace("\\", "\\\\").replace("'", "\\'")
         sk_safe = sitekey.replace("'", "\\'")
@@ -199,7 +206,7 @@ async def _run_nodriver_hcaptcha(checkout_url, proxy_entry=None, rqdata=None, si
                 holder.id = '__hc_holder';
                 document.body.appendChild(holder);
                 let done = false;
-                const t = setTimeout(() => {{ if (!done) reject('timeout-15s'); }}, 15000);
+                const t = setTimeout(() => {{ if (!done) reject('timeout-20s'); }}, 20000);
                 const wid = hcaptcha.render(holder, {{
                     sitekey: '{sk_safe}',
                     size: 'invisible',
